@@ -1,5 +1,6 @@
 # betacensor
 Real-time screen censorship for Linux/Wayland
+
 **Curb your expectations: this only really works on my machine (CachyOS, KDE Plasma, Wayland). I haven't done much to get it working on other distros/window managers/desktop environments.**
 
 ## What it does
