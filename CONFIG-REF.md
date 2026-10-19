@@ -67,3 +67,47 @@ cover. A class without a suffix follows `confidence`, and keeps following it
 when you move that slider — the suffix is an opt-out, not a snapshot. The
 detector is then run at the lowest floor any censored class asks for, so
 lowering one class cannot be silently undone inside the decoder.
+
+---
+
+## Fixed regions and drawing mode
+
+Regions are covered no matter what the detector says, so nothing can score them
+below a threshold and miss them. Coordinates are fractions of the screen
+(0..1) from the top left, so they survive a resolution change.
+
+```ini
+[regions]
+r1 = 0.10,0.20,0.30,0.25,fill              # a rectangle, optional effect
+p1 = poly:blur 0.10,0.20 0.30,0.22 0.25,0.40   # an outline
+```
+
+An outline's last point joins its first; three points is the minimum that
+encloses anything.
+
+Rather than typing coordinates, set `draw = true` (the GUI has a button) and the
+overlay takes input directly: **drag to trace an outline**, or click two corners
+for a rectangle. **Enter** finishes, **Esc** abandons the current shape, and the
+core clears `draw` when drawing ends. Panic or pause cancels it.
+
+---
+
+## Effects
+
+Fifteen: `fill`, `pixelate`, `blur`, `noise`, `glitch`, `rgbshift`, `tape`,
+`halftone`, `sobel`, `triangle`, `cluster`, `splatter`, `shape`, `caption`,
+`wall`.
+
+On top of those: outlines, drop shadows, growth over time, sticky boxes that
+outlive their last detection, edge smoothing, box dilation, region joining,
+eye-bar-only mode, reverse mode (mask the screen and reveal only detections),
+and a takeover mode that covers everything once a detection persists.
+
+---
+
+## Models
+
+Models are ONNX, YOLO-derived, and swappable at runtime — the taxonomy, class
+names and input geometry are read from the model's own metadata, so adding one
+is a config change rather than a code change. None are shipped with this project--
+you'll need to find some on your own.
