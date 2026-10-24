@@ -369,6 +369,7 @@ int bc_preproc_set_grid(struct bc_preproc *p, int cols, int rows, float overlap,
 }
 
 int bc_preproc_tiles(const struct bc_preproc *p) { return p ? p->tiles : 1; }
+int bc_preproc_cols(const struct bc_preproc *p) { return p ? p->cols : 1; }
 
 int bc_preproc_full_tile(const struct bc_preproc *p)
 {

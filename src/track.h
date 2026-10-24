@@ -137,7 +137,17 @@ struct bc_tracker {
 	/* Counters, reported at exit like every other metric here. */
 	unsigned long created, confirmed, lost, removed;
 	unsigned long matched_high, matched_low, double_claim_avoided;
+	unsigned long revived;   /* detections that took over a nearby lost track */
+	int    revive;           /* the revival pass is on; BC_NO_REVIVE turns it off */
 };
+
+/*
+ * How far from a lost track (in its own size) and how different in area a
+ * detection may be and still take it over. See the revival pass in
+ * bc_tracker_update().
+ */
+#define BC_REVIVE_DIST 1.0f
+#define BC_REVIVE_AREA 2.5f
 
 void bc_tracker_init(struct bc_tracker *tr, float conf, float iou,
                      double memory_ms);

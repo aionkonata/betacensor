@@ -1,6 +1,7 @@
 #include "track.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 /*
@@ -285,6 +286,7 @@ void bc_tracker_init(struct bc_tracker *tr, float conf, float iou,
 	tr->iou_thresh   = iou;
 	tr->memory_ms    = memory_ms;
 	tr->confirm_hits = 1;   /* §2: cover on first sight, do not wait */
+	tr->revive       = getenv("BC_NO_REVIVE") == NULL;
 	/* -1 = follow high_score. memset above already zeroed it, and zero is a
 	 * real threshold meaning "admit everything", so say it explicitly. */
 	for (int i = 0; i < BC_MAX_CLASSES; i++)
@@ -518,6 +520,82 @@ int bc_tracker_update(struct bc_tracker *tr, const struct bc_det *dets, int n,
 	          det_track);
 	associate(tr, dets, lo, nlo, trk_used, lo_used, now, &tr->matched_low,
 	          det_track);
+
+	/*
+	 * 3b. Revival. A detection nothing matched by overlap may still be a
+	 * track that moved further between two looks than its own box overlaps --
+	 * a face turning or a head swinging, which is exactly when overlap is the
+	 * wrong question. Opening a second track for it leaves the first predicted
+	 * in place until its memory runs out, and both are drawn: two covers on
+	 * one face, and a second eye bar beside the first.
+	 *
+	 * So before a detection opens anything it may take over an unmatched
+	 * track of the same kind that is close by (within about its own size) and
+	 * of similar size. It adopts the detection's box outright -- the track's
+	 * velocity was measured on a position it no longer holds -- and keeps its
+	 * identity, so everything keyed to it (age, growth, the eye bar's angle)
+	 * carries across the gap.
+	 *
+	 * Hotscreen gates this on appearance as well (a perceptual hash of the
+	 * box); this is the geometric half of that. A wrong match costs the new
+	 * track's identity and nothing else: the cover still lands where the
+	 * detector put it.
+	 */
+	for (int b = 0; tr->revive && b < nhi; b++) {
+		if (hi_used[b])
+			continue;
+		const struct bc_det *d = &dets[hi[b]];
+		if (censor && !censor[d->cls])
+			continue;
+		const float dcx = d->x + d->w * 0.5f, dcy = d->y + d->h * 0.5f;
+		int best = -1;
+		float best_v = 1e30f;
+		for (int a = 0; a < BC_TRK_MAX; a++) {
+			const struct bc_trk *t = &tr->t[a];
+			if (trk_used[a] || (t->state != BC_TRK_CONFIRMED &&
+			                    t->state != BC_TRK_LOST))
+				continue;
+			if (tr->same_class ? !tr->same_class(t->cls, d->cls)
+			                   : d->cls != t->cls)
+				continue;
+			const float th = t->mean[3], tw = t->mean[2] * th;
+			const float size = tw > th ? tw : th;
+			if (!(size > 1.0f))
+				continue;
+			const float dist = hypotf(dcx - t->mean[0], dcy - t->mean[1]);
+			const float ratio = (d->w * d->h) / (tw * th > 1.0f ? tw * th : 1.0f);
+			if (dist > BC_REVIVE_DIST * size || ratio < 1.0f / BC_REVIVE_AREA ||
+			    ratio > BC_REVIVE_AREA)
+				continue;
+			const float v = dist / size;
+			if (v < best_v) {
+				best_v = v;
+				best = a;
+			}
+		}
+		if (best < 0)
+			continue;
+		struct bc_trk *t = &tr->t[best];
+		float z[4];
+		box_to_z(d, z);
+		const unsigned long hits = t->hits + 1;
+		const double born = t->born;
+		const int cls = t->cls;
+		kf_init(t, z);
+		t->cls = cls;
+		t->hits = hits;
+		t->born = born;
+		t->score = d->score;
+		t->state = BC_TRK_CONFIRMED;
+		t->frozen = 0;
+		t->last_update = t->last_measured = t->last_predict = now;
+		memcpy(t->anchor, z, sizeof t->anchor);
+		trk_used[best] = 1;
+		hi_used[b] = 1;
+		if (det_track)
+			det_track[hi[b]] = best;
+		tr->revived++;
+	}
 
 	/* 4. Confident detections that matched nothing open a track -- but only
 	 *    for a class we are actually censoring. */

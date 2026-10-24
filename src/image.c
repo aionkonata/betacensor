@@ -35,22 +35,29 @@
 #include "preprocess.h"
 #include "join.h"
 #include "seam.h"
+#include "anim.h"
+#include "eyebar.h"
+#include "landmark.h"
 #include "offline.h"
+#include "stream.h"
 #include "util.h"
 
 #include <dirent.h>
 #include <errno.h>
 #include <getopt.h>
 #include <limits.h>
+#include <math.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #define MAX_BOX 64
+#define BC_LM_FACES 8   /* most faces handed to the landmark model at once */
 
 /* The live path's seam threshold (bc_main.c), so a tiled photo rejoins a
  * subject cut by a tile edge exactly as the screen would. */
@@ -125,14 +132,32 @@ static const struct fmt *fmt_for(const char *ext)
 }
 
 /*
+ * Will this input be written as an animation? Only an animated GIF, WebP or
+ * PNG whose target format can animate: GIF, WebP and PNG (as an APNG). Asked
+ * for JPEG, BMP, TIFF or AVIF it is written as a still of its first frame,
+ * since those cannot hold the rest.
+ */
+static int writes_animation(const char *in, const char *format)
+{
+	const char *ie = ext_of(in);
+	if (strcasecmp(ie, "gif") && strcasecmp(ie, "webp") && strcasecmp(ie, "png"))
+		return 0;
+	const char *target = (format && strcmp(format, "same")) ? format : ie;
+	return bc_anim_fmt_for(target) && bc_anim_is_animated(in);
+}
+
+/*
  * The output extension for an input. "same" keeps the input's own, except a
- * GIF, which becomes a PNG: only its first frame is censored, and a GIF
- * written back from a 24-bit render would also be re-quantised to 256
- * colours for no reason. Pury.fi makes the same substitution.
+ * GIF that is not an animation, which becomes a PNG: a GIF written back from
+ * a 24-bit render would be re-quantised to 256 colours for no reason, and with
+ * one frame there is nothing a GIF holds that a PNG does not. Pury.fi makes
+ * the same substitution. An animated one stays what it is.
  */
 static const char *out_ext(const char *in, const char *format)
 {
 	const char *e = ext_of(in);
+	if (writes_animation(in, format))
+		return (format && strcmp(format, "same")) ? format : e;
 	if (format && strcmp(format, "same"))
 		return format;
 	if (!strcasecmp(e, "gif"))
@@ -468,7 +493,7 @@ static int decode(const char *path, int max_side, struct image *im)
 	 * still -- a still simply ends after one.
 	 */
 	snprintf(cmd, sizeof cmd,
-	         "ffmpeg -v error -i - -frames:v 2 -f image2pipe -c:v pam "
+	         "ffmpeg -v error -i - -fps_mode passthrough -frames:v 2 -f image2pipe -c:v pam "
 	         "-pix_fmt rgba - < %s", q);
 	FILE *f = popen(cmd, "r");
 	if (!f)
@@ -598,6 +623,8 @@ struct engine {
 	int                 harden, badge;   /* both on unless asked not to */
 	uint64_t            seed;            /* this run's hardening seed */
 	struct bc_off_badge bdg;
+	/* The eye bar's landmark model and counters; see offline.h. */
+	struct bc_off_eb    eb;
 };
 
 /* The model and the config. Enough for --list-classes; no GL yet. */
@@ -750,6 +777,35 @@ static int engine_detect(struct engine *e, const struct image *im, float conf,
 	return 0;
 }
 
+/* The heads among d[], for the eye bar, and a way back to them. */
+static void engine_bars(struct engine *e, const struct bc_det *d, int n,
+                        struct bc_eyebar *bars, int *kind)
+{
+	struct bc_off_face faces[BC_MAX_DET];
+	struct bc_eyebar   hb[BC_MAX_DET];
+	int                hk[BC_MAX_DET], idx[BC_MAX_DET], nh = 0;
+	for (int i = 0; i < n; i++) {
+		kind[i] = 0;
+		if (bc_is_head_class(bc_class_name(d[i].cls))) {
+			faces[nh] = (struct bc_off_face){ d[i].x, d[i].y, d[i].w, d[i].h };
+			idx[nh++] = i;
+		}
+	}
+	bc_off_eb_bars(&e->eb, &e->cfg, &e->g, faces, nh, hb, hk);
+	for (int m = 0; m < nh; m++) {
+		bars[idx[m]] = hb[m];
+		kind[idx[m]] = hk[m];
+	}
+}
+
+static void note_class(char *found, size_t cap, const char *cn)
+{
+	if (cn && cap && !strstr(found, cn) &&
+	    strlen(found) + strlen(cn) + 3 < cap)
+		snprintf(found + strlen(found), cap - strlen(found), "%s%s",
+		         *found ? ", " : "", cn);
+}
+
 /*
  * The covers for one set of classes: the covered detections, rejoined across
  * tile seams, grown by the dilation, clamped, then joined. The class filter
@@ -778,10 +834,26 @@ static int engine_boxes(struct engine *e, int w, int h,
 		                  SEAM_THRESH, bc_off_classes_similar);
 	}
 
+	/* After the seam merge, so an eye cut by a tile edge is judged whole. */
+	n = bc_off_drop_eyes(&e->cfg, d, n, &e->eb.eyes_dropped);
+
+	struct bc_eyebar bars[BC_MAX_DET];
+	int kind[BC_MAX_DET] = { 0 };
+	if (e->cfg.eye_bar)
+		engine_bars(e, d, n, bars, kind);
+
 	int nb = 0;
 	if (found_cap)
 		found[0] = 0;
 	for (int i = 0; i < n && nb < MAX_BOX; i++) {
+		/*
+		 * With the face left alone (eye_bar_face off) the bar *is* the
+		 * cover, and nothing is drawn over the rest of the face.
+		 */
+		if (kind[i] && !e->cfg.eye_bar_face) {
+			note_class(found, found_cap, bc_class_name(d[i].cls));
+			continue;
+		}
 		/* §2's dilation, then clamp: a scissor outside the image
 		 * draws nothing. */
 		float dx = d[i].w * e->cfg.dilate / 200.0f;
@@ -798,11 +870,7 @@ static int engine_boxes(struct engine *e, int w, int h,
 		boxes[nb++] = bc_off_box(&e->cfg, d[i].cls, (int)x0, (int)y0,
 		                         (int)(x1 - x0 + 0.999f),
 		                         (int)(y1 - y0 + 0.999f));
-		const char *cn = bc_class_name(d[i].cls);
-		if (cn && found_cap && !strstr(found, cn) &&
-		    strlen(found) + strlen(cn) + 3 < found_cap)
-			snprintf(found + strlen(found), found_cap - strlen(found),
-			         "%s%s", *found ? ", " : "", cn);
+		note_class(found, found_cap, bc_class_name(d[i].cls));
 	}
 	if (e->test_box[2] > 0 && nb < MAX_BOX)
 		boxes[nb++] = bc_off_box(&e->cfg, -1, e->test_box[0],
@@ -810,6 +878,26 @@ static int engine_boxes(struct engine *e, int w, int h,
 		                         e->test_box[3]);
 	if (e->cfg.join && nb > 1)
 		nb = bc_join_boxes(boxes, nb, 6, e->cfg.join_waste);
+
+	/*
+	 * The bars, last: drawn on top of the face cover they belong to, and
+	 * after the join, which would otherwise merge an upright band into the
+	 * face under it and keep the wrong effect. (bc_join_boxes already
+	 * leaves turned boxes alone, for the same reason.)
+	 *
+	 * Grown by the dilation the way the live censor grows them. With the
+	 * face covered too, the bar is laid out as fractions of the face and so
+	 * scales about the face's centre; on its own it grows about its own.
+	 */
+	const float grow = 1.0f + e->cfg.dilate / 100.0f;
+	for (int i = 0; i < n && nb < MAX_BOX; i++) {
+		if (!kind[i])
+			continue;
+		const struct bc_off_face face = { d[i].x, d[i].y, d[i].w, d[i].h };
+		struct bc_box bx;
+		if (bc_off_eb_box(&e->cfg, d[i].cls, &face, &bars[i], grow, w, h, &bx))
+			boxes[nb++] = bx;
+	}
 
 	if (kept) {
 		memcpy(kept, d, (size_t)n * sizeof *d);
@@ -850,6 +938,7 @@ static unsigned char *engine_render(struct engine *e,
 
 static void engine_stop(struct engine *e, int hung)
 {
+	bc_off_eb_free(&e->eb);
 	free(e->render);
 	free(e->tensor);
 	if (e->pp)
@@ -897,13 +986,7 @@ static int parse_cover(const struct engine *e, const char *list, int *cover)
 }
 
 /* ------------------------------------------------------------------ */
-/* --serve: the GUI's preview                                          */
-
-static void reply_err(const char *msg)
-{
-	printf("ERR %s\n", msg);
-	fflush(stdout);
-}
+/* Manual edits                                                        */
 
 static int same_stat(const struct stat *a, const struct stat *b)
 {
@@ -911,6 +994,182 @@ static int same_stat(const struct stat *a, const struct stat *b)
 	       a->st_mtim.tv_sec == b->st_mtim.tv_sec &&
 	       a->st_mtim.tv_nsec == b->st_mtim.tv_nsec &&
 	       a->st_ino == b->st_ino;
+}
+
+/*
+ * What the user did by hand in the panel's preview, per image, so the batch
+ * writes what they saw. One edit per line of a TSV file:
+ *
+ *   <path> TAB <w>x<h> TAB add  TAB x TAB y TAB w TAB h
+ *   <path> TAB <w>x<h> TAB drop TAB x TAB y
+ *
+ * An *add* is a cover drawn by hand, with the global effect -- the backstop
+ * for what the detector missed, like a fixed region in the live censor. A
+ * *drop* is a point: "no cover where I clicked". It is a point and not the
+ * box that was there so that it keeps working when the classes or the effect
+ * change, which moves boxes but not the thing the user was pointing at.
+ *
+ * The path and the image's pixel size both have to match. A different file
+ * written over the same name has different pixels, and coordinates from the
+ * old one would cover the wrong place -- silently, which is worse than not
+ * applying them.
+ *
+ * These are the only way covers are ever removed. They are explicit, per
+ * image, and shown in the preview; nothing here removes a cover on its own.
+ */
+struct edit {
+	char *path;           /* realpath'd where the file still exists */
+	int   iw, ih;
+	int   kind;           /* 0 add, 1 drop */
+	int   x, y, w, h;
+};
+
+struct edits {
+	char        *file;
+	struct edit *v;
+	int          n, cap;
+	struct stat  st;
+	int          have_st;
+};
+
+static void edits_clear(struct edits *ed)
+{
+	for (int i = 0; i < ed->n; i++)
+		free(ed->v[i].path);
+	free(ed->v);
+	ed->v = NULL;
+	ed->n = ed->cap = 0;
+}
+
+static void edits_load(struct edits *ed)
+{
+	edits_clear(ed);
+	ed->have_st = ed->file && stat(ed->file, &ed->st) == 0;
+	FILE *f = ed->file ? fopen(ed->file, "r") : NULL;
+	if (!f)
+		return;
+	static char line[PATH_MAX + 256];
+	while (fgets(line, sizeof line, f)) {
+		line[strcspn(line, "\r\n")] = 0;
+		char *save = NULL;
+		char *path = strtok_r(line, "\t", &save);
+		char *dim  = strtok_r(NULL, "\t", &save);
+		char *kind = strtok_r(NULL, "\t", &save);
+		if (!path || !dim || !kind)
+			continue;
+		struct edit e = { 0 };
+		if (sscanf(dim, "%dx%d", &e.iw, &e.ih) != 2)
+			continue;
+		const char *a = strtok_r(NULL, "\t", &save);
+		const char *b = strtok_r(NULL, "\t", &save);
+		const char *c = strtok_r(NULL, "\t", &save);
+		const char *d = strtok_r(NULL, "\t", &save);
+		if (!strcmp(kind, "add") && a && b && c && d) {
+			e.kind = 0;
+			e.x = atoi(a); e.y = atoi(b); e.w = atoi(c); e.h = atoi(d);
+			if (e.w < 1 || e.h < 1)
+				continue;
+		} else if (!strcmp(kind, "drop") && a && b) {
+			e.kind = 1;
+			e.x = atoi(a); e.y = atoi(b);
+		} else {
+			continue;
+		}
+		char rp[PATH_MAX];
+		e.path = strdup(realpath(path, rp) ? rp : path);
+		if (ed->n == ed->cap) {
+			ed->cap = ed->cap ? ed->cap * 2 : 32;
+			ed->v = realloc(ed->v, (size_t)ed->cap * sizeof *ed->v);
+			if (!ed->v)
+				DIE("out of memory reading edits");
+		}
+		ed->v[ed->n++] = e;
+	}
+	fclose(f);
+}
+
+/* Re-read when the file changed: the panel rewrites it on every edit. */
+static void edits_refresh(struct edits *ed)
+{
+	if (!ed->file)
+		return;
+	struct stat st;
+	const int have = stat(ed->file, &st) == 0;
+	if (have != ed->have_st || (have && !same_stat(&st, &ed->st)))
+		edits_load(ed);
+}
+
+/*
+ * Apply this image's edits to its covers: drops first (removing every cover
+ * that contains a dropped point, order kept so bars stay on top), then adds
+ * appended after. `removed` receives the boxes taken out, for the preview.
+ * Returns the new count; *first_manual is where the adds begin.
+ */
+static int edits_apply(const struct edits *ed, const char *real, int iw, int ih,
+                       const struct bc_config *cfg, struct bc_box *boxes,
+                       int nb, struct bc_box *removed, int *n_removed,
+                       int *first_manual)
+{
+	*n_removed = 0;
+	for (int i = 0; i < ed->n; i++) {
+		const struct edit *e = &ed->v[i];
+		if (e->kind != 1 || e->iw != iw || e->ih != ih ||
+		    strcmp(e->path, real))
+			continue;
+		for (int b = 0; b < nb;) {
+			if (!bc_off_box_has(&boxes[b], e->x, e->y)) {
+				b++;
+				continue;
+			}
+			if (*n_removed < MAX_BOX)
+				removed[(*n_removed)++] = boxes[b];
+			memmove(&boxes[b], &boxes[b + 1],
+			        (size_t)(nb - b - 1) * sizeof *boxes);
+			nb--;
+		}
+	}
+	*first_manual = nb;
+	for (int i = 0; i < ed->n && nb < MAX_BOX; i++) {
+		const struct edit *e = &ed->v[i];
+		if (e->kind != 0 || e->iw != iw || e->ih != ih ||
+		    strcmp(e->path, real))
+			continue;
+		int x0 = e->x < 0 ? 0 : e->x, y0 = e->y < 0 ? 0 : e->y;
+		int x1 = e->x + e->w > iw ? iw : e->x + e->w;
+		int y1 = e->y + e->h > ih ? ih : e->y + e->h;
+		if (x1 - x0 < 1 || y1 - y0 < 1)
+			continue;
+		boxes[nb++] = bc_off_box(cfg, -1, x0, y0, x1 - x0, y1 - y0);
+	}
+	return nb;
+}
+
+/* Did an edit take this box out? Judged by overlap with what was removed: a
+ * bar sits inside its face, so a removed bar must count for the face too. */
+static int was_removed(const struct bc_box *removed, int n_removed,
+                       float x, float y, float w, float h)
+{
+	for (int i = 0; i < n_removed; i++) {
+		const float ox = fminf(x + w, removed[i].x + removed[i].w) -
+		                 fmaxf(x, removed[i].x);
+		const float oy = fminf(y + h, removed[i].y + removed[i].h) -
+		                 fmaxf(y, removed[i].y);
+		if (ox <= 0 || oy <= 0)
+			continue;
+		const float small = fminf(w * h, (float)removed[i].w * removed[i].h);
+		if (small > 0 && ox * oy >= 0.5f * small)
+			return 1;
+	}
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* --serve: the GUI's preview                                          */
+
+static void reply_err(const char *msg)
+{
+	printf("ERR %s\n", msg);
+	fflush(stdout);
 }
 
 /*
@@ -922,8 +1181,14 @@ static int same_stat(const struct stat *a, const struct stat *b)
  * per request on stdout, either "ERR <message>" or:
  *
  *   OK <w> <h> <boxes> <dets> <animated>
- *   B <x> <y> <w> <h>                          once per cover drawn
- *   D <x> <y> <w> <h> <covered> <score> <name> once per detection
+ *   B <x> <y> <w> <h> <angle> <manual>         once per cover drawn; angle in
+ *                                              radians, GL's (an eye bar is
+ *                                              turned); manual is 1 for one
+ *                                              the user drew
+ *   D <x> <y> <w> <h> <state> <score> <name>   once per detection; state 1
+ *                                              covered, 0 found but not
+ *                                              ticked, 2 covered until the
+ *                                              user removed it
  *   <w*h*3 bytes>  the image as detected (RGB, top-down)
  *   <w*h*3 bytes>  the image as it would be written
  *
@@ -933,7 +1198,7 @@ static int same_stat(const struct stat *a, const struct stat *b)
  * the main settings panel; a different model there ends this process with
  * status 3, for the GUI to start a fresh one.
  */
-static int serve(struct engine *e)
+static int serve(struct engine *e, struct edits *ed)
 {
 	struct image im = { 0 };
 	char cached[PATH_MAX] = "";
@@ -1034,11 +1299,18 @@ static int serve(struct engine *e)
 			use = exact;
 		}
 
-		struct bc_box boxes[MAX_BOX];
+		struct bc_box boxes[MAX_BOX], removed[MAX_BOX];
 		struct bc_det kept[BC_MAX_DET];
-		int n_kept = 0;
-		const int nb = engine_boxes(e, im.w, im.h, use, n_use, cover,
-		                            boxes, kept, &n_kept, NULL, 0);
+		int n_kept = 0, n_removed = 0, first_manual;
+		int nb = engine_boxes(e, im.w, im.h, use, n_use, cover,
+		                      boxes, kept, &n_kept, NULL, 0);
+		/* The user's own edits, from the file the panel keeps. */
+		char real[PATH_MAX];
+		if (!realpath(path, real))
+			snprintf(real, sizeof real, "%s", path);
+		edits_refresh(ed);
+		nb = edits_apply(ed, real, im.w, im.h, &e->cfg, boxes, nb, removed,
+		                 &n_removed, &first_manual);
 		int badged;
 		const unsigned char *pix = engine_render(e, boxes, nb, im.hash,
 		                                         &badged);
@@ -1053,11 +1325,15 @@ static int serve(struct engine *e)
 		printf("OK %d %d %d %d %d\n", im.w, im.h, nb, n_kept + n_unc,
 		       im.animated);
 		for (int i = 0; i < nb; i++)
-			printf("B %d %d %d %d\n", boxes[i].x, boxes[i].y,
-			       boxes[i].w, boxes[i].h);
+			printf("B %d %d %d %d %.5f %d\n", boxes[i].x, boxes[i].y,
+			       boxes[i].w, boxes[i].h, boxes[i].angle,
+			       i >= first_manual);
+		/* State: 1 covered, 2 covered until you removed it. */
 		for (int i = 0; i < n_kept; i++)
-			printf("D %d %d %d %d 1 %.3f %s\n", (int)kept[i].x,
+			printf("D %d %d %d %d %d %.3f %s\n", (int)kept[i].x,
 			       (int)kept[i].y, (int)kept[i].w, (int)kept[i].h,
+			       was_removed(removed, n_removed, kept[i].x, kept[i].y,
+			                   kept[i].w, kept[i].h) ? 2 : 1,
 			       kept[i].score, bc_class_name(kept[i].cls));
 		for (int i = 0; i < n_raw; i++)
 			if (!cover[raw[i].cls])
@@ -1072,6 +1348,226 @@ static int serve(struct engine *e)
 	}
 	image_free(&im);
 	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Animations                                                          */
+
+/*
+ * An animated GIF, WebP or APNG is a video with a duration per frame, so it is
+ * censored as one: through the same stream as bc-video (stream.c), which keeps
+ * a tracker and each eye bar's history from frame to frame. Censoring the
+ * frames as independent stills would be simpler and worse -- a detection the
+ * model misses on one frame would flash uncovered for that frame, where the
+ * tracker carries the box through it.
+ *
+ * Differences from a video worth knowing: no tile grid (as in bc-video, and
+ * animations are small); the user's hand edits apply to *every* frame, which is
+ * the only reading of "cover here" / "no cover here" that makes sense for a
+ * picture that moves; and time on the tracker's clock is the sum of the
+ * frames' own durations, so a slow frame is a long gap to the tracker too.
+ */
+
+struct anim_edit_ctx {
+	const struct edits     *ed;
+	const struct bc_config *cfg;
+	char                    real[PATH_MAX];
+	int                     w, h;
+};
+
+static int anim_edit_adjust(void *user, struct bc_box *boxes, int nb, int max)
+{
+	const struct anim_edit_ctx *c = user;
+	struct bc_box removed[MAX_BOX];
+	int n_removed, first_manual;
+	(void)max;
+	return edits_apply(c->ed, c->real, c->w, c->h, c->cfg, boxes, nb, removed,
+	                   &n_removed, &first_manual);
+}
+
+enum { ANIM_OK = 0, ANIM_FAILED = -1, ANIM_HUNG = -2, ANIM_STOPPED = -3 };
+
+struct anim_result {
+	long   frames, censored, reused;
+	double seconds, play_ms;
+};
+
+static int censor_animation(struct engine *e, const int *cover,
+                            const struct edits *ed, const char *in,
+                            const char *out, struct anim_result *res)
+{
+	memset(res, 0, sizeof *res);
+	const struct bc_anim_fmt *af = bc_anim_fmt_for(ext_of(out));
+	int w, h;
+	struct bc_anim_reader *rd = af ? bc_anim_open(in, &w, &h) : NULL;
+	if (!rd) {
+		ERR("%s: could not decode it as an animation", in);
+		return ANIM_FAILED;
+	}
+	if (bc_off_gl_resize(&e->g, w, h) != 0) {
+		bc_anim_close(rd);
+		return ANIM_FAILED;
+	}
+	/*
+	 * The frames are staged on disk until the encoder has seen them all, at
+	 * 4 bytes a pixel. A long or large animation can want gigabytes, and
+	 * running out of room halfway through is a worse way to find that out
+	 * than being told first.
+	 */
+	{
+		char dir[PATH_MAX];
+		snprintf(dir, sizeof dir, "%s", out);
+		char *slash = strrchr(dir, '/');
+		if (slash)
+			*slash = 0;
+		else
+			snprintf(dir, sizeof dir, ".");
+		struct statvfs sv;
+		const double need = (double)bc_anim_expected(rd) * w * h * 4.0;
+		if (need > 0 && statvfs(dir, &sv) == 0 &&
+		    need > 0.8 * (double)sv.f_bavail * (double)sv.f_frsize) {
+			ERR("%s: %d frames of %dx%d need about %.1f GB of working space "
+			    "beside the output, and %.1f GB is free", in,
+			    bc_anim_expected(rd), w, h, need / 1e9,
+			    (double)sv.f_bavail * (double)sv.f_frsize / 1e9);
+			bc_anim_close(rd);
+			return ANIM_FAILED;
+		}
+	}
+	const double t0 = bc_off_now_ms();
+
+	/*
+	 * A stream wants one tile per frame and the video-style tracker
+	 * confidence; the engine's grid is put back afterwards. The preprocessor
+	 * here is the plain 1x1 one, so the engine's own is left untouched.
+	 */
+	bc_detect_wait_idle(e->det);
+	struct bc_preproc *pp = bc_preproc_create(bc_detect_net_w(e->det),
+	                                          bc_detect_net_h(e->det));
+	float *tensor = pp ? malloc(bc_preproc_total_floats(pp) * sizeof *tensor)
+	                   : NULL;
+	const size_t px = (size_t)w * h;
+	unsigned char *rgba = malloc(px * 4), *flat = malloc(px * 3);
+	unsigned char *rend = malloc(px * 3), *outa = malloc(px * 4);
+	if (!pp || !tensor || !rgba || !flat || !rend || !outa ||
+	    bc_detect_set_tiles(e->det, 1) != 0) {
+		ERR("%s: out of memory or no detector for an animation", in);
+		bc_anim_close(rd);
+		free(rgba); free(flat); free(rend); free(outa); free(tensor);
+		if (pp)
+			bc_preproc_destroy(pp);
+		return ANIM_FAILED;
+	}
+	bc_detect_set_conf(e->det, e->cfg.confidence * 0.5f);
+
+	struct bc_off_badge bdg = { 0 };
+	const int badge_on = e->badge && bc_off_badge_make(&bdg, w, h) == 0;
+
+	struct anim_edit_ctx ctx = { .ed = ed, .cfg = &e->cfg, .w = w, .h = h };
+	if (ed && ed->file) {
+		if (!realpath(in, ctx.real))
+			snprintf(ctx.real, sizeof ctx.real, "%s", in);
+	}
+	struct bc_stream st = {
+		.cfg = &e->cfg, .cover = cover, .det = e->det, .g = &e->g, .pp = pp,
+		.tensor = tensor, .bdg = badge_on ? &bdg : NULL, .harden = e->harden,
+		.test_box = { e->test_box[0], e->test_box[1], e->test_box[2],
+		              e->test_box[3] },
+	};
+	if (ed && ed->file) {
+		st.adjust = anim_edit_adjust;
+		st.adjust_user = &ctx;
+	}
+	bc_stream_init(&st);
+
+	struct bc_anim_writer *wr = bc_anim_begin(out, af, w, h);
+	int rc = wr ? ANIM_OK : ANIM_FAILED;
+	double t_ms = 0.0, dur;
+	int r;
+	while (rc == ANIM_OK && (r = bc_anim_next(rd, rgba, &dur)) == 1) {
+		if (stop_requested) {
+			rc = ANIM_STOPPED;
+			break;
+		}
+		int has_alpha = 0;
+		uint64_t hv = 1469598103934665603ull;
+		for (size_t p = 0; p < px; p++) {
+			const unsigned a = rgba[p * 4 + 3];
+			has_alpha |= a != 255;
+			for (int c = 0; c < 3; c++)
+				flat[p * 3 + c] = (unsigned char)
+				    ((rgba[p * 4 + c] * a + 255u * (255u - a) + 127u) / 255u);
+		}
+		/* One hardening pattern for the whole animation, keyed on its first
+		 * frame: fixed to the picture and not to time, as in a video. */
+		if (st.frames == 0) {
+			for (size_t i = 0; i < px * 4; i++)
+				hv = (hv ^ rgba[i]) * 1099511628211ull;
+			st.harden_seed = bc_off_mix_seed(e->seed, hv);
+		}
+		struct bc_box boxes[BC_STREAM_MAX_BOX];
+		int nb = 0;
+		const int sr = bc_stream_frame(&st, flat, t_ms, rend, boxes, &nb);
+		if (sr == BC_STREAM_HUNG) {
+			rc = ANIM_HUNG;
+			break;
+		}
+		if (sr == BC_STREAM_BLANKED) {
+			/* §6: nobody looked at this frame, so the animation is not
+			 * written at all -- a black frame in the middle of someone's GIF
+			 * is not a result either. */
+			rc = ANIM_FAILED;
+			break;
+		}
+		if (af->alpha && has_alpha)
+			bc_off_compose_alpha(rend, flat, rgba, w, h, boxes, nb, outa);
+		else
+			for (size_t p = 0; p < px; p++) {
+				memcpy(outa + p * 4, rend + p * 3, 3);
+				outa[p * 4 + 3] = 255;
+			}
+		if (bc_anim_add(wr, outa, dur, af->alpha && has_alpha) != 0) {
+			ERR("%s: could not stage a frame", in);
+			rc = ANIM_FAILED;
+			break;
+		}
+		t_ms += dur;
+	}
+	if (rc == ANIM_OK && r < 0) {
+		ERR("%s: the animation could not be read to its end", in);
+		rc = ANIM_FAILED;
+	}
+	if (rc == ANIM_OK && st.frames == 0) {
+		ERR("%s: no frames decoded", in);
+		rc = ANIM_FAILED;
+	}
+	if (rc == ANIM_OK) {
+		if (bc_anim_finish(wr) != 0) {
+			ERR("%s: could not write %s", in, out);
+			rc = ANIM_FAILED;
+		}
+	} else if (wr) {
+		bc_anim_abort(wr);
+	}
+	if (st.blanked_frames)
+		ERR("%s: %ld frame%s had no detection result; nothing written", in,
+		    st.blanked_frames, st.blanked_frames == 1 ? "" : "s");
+
+	res->frames = st.frames;
+	res->censored = st.censored_frames;
+	res->reused = (long)st.reused;
+	res->play_ms = t_ms;
+	res->seconds = (bc_off_now_ms() - t0) / 1000.0;
+
+	bc_stream_free(&st);
+	bc_anim_close(rd);
+	bc_off_badge_free(&bdg);
+	free(rgba); free(flat); free(rend); free(outa); free(tensor);
+	bc_preproc_destroy(pp);
+	/* Back to the grid the stills use. */
+	bc_detect_wait_idle(e->det);
+	bc_detect_set_tiles(e->det, e->tiles);
+	return rc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1104,13 +1600,18 @@ static void usage(void)
 	    "                       watermark, to make them harder to reverse\n"
 	    "      --no-badge       no \"censored with BetaCensor\" badge in the\n"
 	    "                       bottom-right corner\n"
+	    "      --edits FILE     covers drawn and removed by hand in the panel's\n"
+	    "                       preview (see edits_load() in image.c for the\n"
+	    "                       format); applied to the images they name\n"
 	    "      --serve          preview server for the GUI: requests on\n"
 	    "                       stdin, rendered images on stdout (see\n"
 	    "                       serve() in image.c for the protocol)\n"
 	    "\n"
-	    "Reads png, jpg, webp, bmp, gif, avif and tiff. An animated image\n"
-	    "has only its first frame censored -- use bc-video for the whole\n"
-	    "animation. Metadata (EXIF, GPS) is not copied to the output.\n"
+	    "Reads png, jpg, webp, bmp, gif, avif and tiff. An animated GIF, WebP\n"
+	    "or PNG is censored frame by frame, with tracking between frames, and\n"
+	    "written back animated with every frame's own timing. Asked for jpg,\n"
+	    "bmp, tiff or avif, it is written as a still of its first frame.\n"
+	    "Metadata (EXIF, GPS) is not copied to the output.\n"
 	    "\n"
 	    "  BC_IMAGE_CONFIG    config file (default betacensor.conf)\n"
 	    "  BC_IMAGE_TEST_BOX  x,y,w,h: also cover this box in every image\n"
@@ -1124,6 +1625,7 @@ int main(int argc, char **argv)
 	const char *format = "same";
 	int overwrite = 0, list_classes = 0, serve_mode = 0;
 	int no_badge = 0, no_harden = 0;
+	const char *edits_file = NULL;
 
 	static const struct option opts[] = {
 		{ "out",          required_argument, 0, 'o' },
@@ -1135,6 +1637,7 @@ int main(int argc, char **argv)
 		{ "serve",        no_argument,       0, 'S' },
 		{ "no-badge",     no_argument,       0, 'B' },
 		{ "no-harden",    no_argument,       0, 'H' },
+		{ "edits",        required_argument, 0, 'E' },
 		{ "help",        no_argument,       0, 'h' },
 		{ 0, 0, 0, 0 }
 	};
@@ -1150,6 +1653,7 @@ int main(int argc, char **argv)
 		case 'S': serve_mode = 1; break;
 		case 'B': no_badge = 1; break;
 		case 'H': no_harden = 1; break;
+		case 'E': edits_file = optarg; break;
 		case 'h': usage(); return 0;
 		default:  usage(); return 2;
 		}
@@ -1183,6 +1687,11 @@ int main(int argc, char **argv)
 	e.badge  = !no_badge;
 	e.seed   = bc_off_run_seed();
 
+	struct edits edits = { .file = (char *)edits_file };
+	if (edits_file)
+		edits_load(&edits);
+	long edits_applied_removed = 0, edits_applied_added = 0;
+
 	if (list_classes) {
 		for (int c = 0; c < bc_class_count(); c++)
 			printf("%d\t%s\t%d\n", c, bc_class_name(c),
@@ -1196,8 +1705,9 @@ int main(int argc, char **argv)
 		signal(SIGTERM, SIG_DFL);
 		if (engine_start(&e) != 0)
 			return 1;
-		const int rc = serve(&e);
+		const int rc = serve(&e, &edits);
 		engine_stop(&e, rc == 1);
+		edits_clear(&edits);
 		return rc;
 	}
 
@@ -1289,6 +1799,8 @@ int main(int argc, char **argv)
 	    n_cover == 1 ? "" : "es", e.tiles, e.tiles == 1 ? "" : "s");
 
 	int done = 0, skipped = 0, failed = 0, with_boxes = 0, hung = 0;
+	int anims_done = 0;
+	long anim_frames = 0;
 	long boxes_total = 0;
 	unsigned char *outbuf = NULL;
 	size_t outbuf_cap = 0;
@@ -1309,6 +1821,44 @@ int main(int argc, char **argv)
 		if (!overwrite && access(out, F_OK) == 0) {
 			LOG("[%d/%d] skip %s (already done)", k, jobs.n, out);
 			skipped++;
+			continue;
+		}
+
+		/* An animation is a sequence, and goes through the stream. */
+		if (writes_animation(in, format)) {
+			if (mkparent(out) != 0) {
+				ERR("[%d/%d] FAILED %s: cannot create %s", k, jobs.n, in,
+				    out);
+				failed++;
+				continue;
+			}
+			struct anim_result ar;
+			const int arc = censor_animation(&e, cover, edits.file ? &edits : NULL,
+			                                 in, out, &ar);
+			if (arc == ANIM_STOPPED)
+				break;
+			if (arc == ANIM_HUNG) {
+				ERR("[%d/%d] the detector gave no answer in 10 s -- "
+				    "stopping", k, jobs.n);
+				failed++;
+				hung = 1;
+				break;
+			}
+			if (arc != ANIM_OK) {
+				ERR("[%d/%d] FAILED %s: animation not written", k, jobs.n, in);
+				failed++;
+				continue;
+			}
+			done++;
+			anims_done++;
+			anim_frames += ar.frames;
+			if (ar.censored)
+				with_boxes++;
+			LOG("[%d/%d] %s -> %s: animation, %ld frame%s over %.2f s, %ld "
+			    "with a cover%s%s", k, jobs.n, in, out, ar.frames,
+			    ar.frames == 1 ? "" : "s", ar.play_ms / 1000.0, ar.censored,
+			    ar.reused ? "  [repeated frames reused their detections]" : "",
+			    "");
 			continue;
 		}
 
@@ -1351,11 +1901,22 @@ int main(int argc, char **argv)
 			continue;
 		}
 
-		struct bc_box boxes[MAX_BOX];
+		struct bc_box boxes[MAX_BOX], removed[MAX_BOX];
 		char found[160];
-		const int nb = engine_boxes(&e, im.w, im.h, dets, n, cover,
-		                            boxes, NULL, NULL, found,
-		                            sizeof found);
+		int nb = engine_boxes(&e, im.w, im.h, dets, n, cover,
+		                      boxes, NULL, NULL, found, sizeof found);
+		/* What the user did by hand in the preview, if they gave us it. */
+		int n_removed = 0, first_manual = nb;
+		if (edits.file) {
+			char rp[PATH_MAX];
+			if (!realpath(in, rp))
+				snprintf(rp, sizeof rp, "%s", in);
+			nb = edits_apply(&edits, rp, im.w, im.h, &e.cfg, boxes, nb,
+			                 removed, &n_removed, &first_manual);
+		}
+		const int n_added = nb - first_manual;
+		edits_applied_removed += n_removed;
+		edits_applied_added += n_added;
 		int badged;
 		const unsigned char *render = engine_render(&e, boxes, nb,
 		                                            im.hash, &badged);
@@ -1384,22 +1945,8 @@ int main(int argc, char **argv)
 		const int keep_alpha = im.has_alpha && fm && fm->alpha;
 		const unsigned char *pix = render;
 		if (keep_alpha) {
-			for (size_t p = 0; p < px; p++) {
-				const int x = (int)(p % im.w), y = (int)(p / im.w);
-				int touched = memcmp(render + p * 3,
-				                     im.rgb + p * 3, 3) != 0;
-				for (int b = 0; b < nb && !touched; b++)
-					touched = x >= boxes[b].x &&
-					          y >= boxes[b].y &&
-					          x < boxes[b].x + boxes[b].w &&
-					          y < boxes[b].y + boxes[b].h;
-				if (touched) {
-					memcpy(outbuf + p * 4, render + p * 3, 3);
-					outbuf[p * 4 + 3] = 255;
-				} else {
-					memcpy(outbuf + p * 4, im.rgba + p * 4, 4);
-				}
-			}
+			bc_off_compose_alpha(render, im.rgb, im.rgba, im.w, im.h, boxes,
+			                     nb, outbuf);
 			pix = outbuf;
 		}
 
@@ -1420,8 +1967,13 @@ int main(int argc, char **argv)
 		boxes_total += nb;
 		if (nb)
 			with_boxes++;
-		LOG("[%d/%d] %s -> %s: %d covered%s%s%s%s%s", k, jobs.n, in, out,
+		char edited[96] = "";
+		if (n_removed || n_added)
+			snprintf(edited, sizeof edited, "  [your edits: +%d drawn, -%d removed]",
+			         n_added, n_removed);
+		LOG("[%d/%d] %s -> %s: %d covered%s%s%s%s%s%s", k, jobs.n, in, out,
 		    nb, *found ? " (" : "", found, *found ? ")" : "",
+		    edited,
 		    im.animated ? "  [animated: first frame only]" : "",
 		    e.badge && !badged ? "  [too small for the badge]" : "");
 		image_free(&im);
@@ -1432,15 +1984,27 @@ int main(int argc, char **argv)
 	LOG("summary");
 	LOG("  images written          : %d", done);
 	LOG("  with something covered  : %d", with_boxes);
+	if (anims_done)
+		LOG("  of which animations     : %d (%ld frames)", anims_done,
+		    anim_frames);
 	LOG("  boxes drawn             : %ld", boxes_total);
 	LOG("  skipped (already done)  : %d", skipped);
 	LOG("  failed                  : %d", failed);
 	if (not_reached)
 		LOG("  not reached             : %d", not_reached);
+	if (e.cfg.eye_bar && (e.eb.bars || e.eb.bands))
+		LOG("  eye bars                : %lu from landmarks, %lu as the band "
+		    "(%lu weak, %lu implausible), %lu EYE boxes left to them",
+		    e.eb.bars, e.eb.bands, e.eb.weak, e.eb.rejected,
+		    e.eb.eyes_dropped);
+	if (edits.file)
+		LOG("  your edits              : %ld drawn, %ld removed, across the "
+		    "images they name", edits_applied_added, edits_applied_removed);
 	LOG("  detector errors         : %lu", bc_detect_errors(e.det));
 	LOG("  elapsed                 : %.1fs (%.2f s/image)", secs,
 	    done ? secs / done : 0.0);
 
+	edits_clear(&edits);
 	free(outbuf);
 	engine_stop(&e, hung);
 

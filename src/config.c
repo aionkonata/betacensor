@@ -37,9 +37,11 @@ void bc_config_defaults(struct bc_config *c)
 	c->saw_text_color = 0;
 	c->saw_sections = 0;
 	c->saw_full_frame = 0;
+	c->saw_split = 0;
 	c->saw_shape = 0;
 	c->saw_strengths = 0;
 	c->saw_grow = 0;
+	c->saw_delay = 0;
 	c->misfiled = 0;
 	c->enabled    = 1;
 	c->draw       = 0;
@@ -95,6 +97,7 @@ void bc_config_defaults(struct bc_config *c)
 	 * covering content that has gone, the failure in the other direction.
 	 */
 	c->sticky_ms  = 400.0f;
+	c->delay_ms   = 0.0f;
 	c->join       = 1;
 	c->join_waste = 0.35f;
 	c->section_cols = 1;
@@ -115,6 +118,7 @@ void bc_config_defaults(struct bc_config *c)
 	 * asked for, and §2 says prefer covering too much.
 	 */
 	c->section_full_frame = 1;
+	c->section_split = 1;
 
 	/*
 	 * Off by default. An outline is the sort of thing that has to be asked
@@ -693,6 +697,10 @@ static int parse(struct bc_config *c, FILE *f, int *seen)
 		else if (!strcasecmp(k, "confidence")) c->confidence = strtof(v, NULL);
 		else if (!strcasecmp(k, "dilate"))     c->dilate     = strtof(v, NULL);
 		else if (!strcasecmp(k, "sticky_ms"))  c->sticky_ms  = strtof(v, NULL);
+		else if (!strcasecmp(k, "delay_ms")) {
+			c->delay_ms = strtof(v, NULL);
+			c->saw_delay = 1;
+		}
 		else if (!strcasecmp(k, "join_waste")) c->join_waste = strtof(v, NULL);
 		else if (!strcasecmp(k, "section_cols")) {
 			c->section_cols = atoi(v);
@@ -707,6 +715,10 @@ static int parse(struct bc_config *c, FILE *f, int *seen)
 		else if (!strcasecmp(k, "section_full_frame")) {
 			c->section_full_frame = truthy(v);
 			c->saw_full_frame = 1;
+		}
+		else if (!strcasecmp(k, "section_split")) {
+			c->section_split = truthy(v);
+			c->saw_split = 1;
 		}
 		else if (!strcasecmp(k, "growth")) {
 			c->growth = strtof(v, NULL);
@@ -871,6 +883,9 @@ static int parse(struct bc_config *c, FILE *f, int *seen)
 	if (c->dilate     > 100.f) c->dilate     = 100.f;
 	if (c->sticky_ms  < 0.f)   c->sticky_ms  = 0.f;
 	if (c->sticky_ms  > 5000.f) c->sticky_ms = 5000.f;
+	/* NaN fails both comparisons and would reach the ring sizing. */
+	if (!(c->delay_ms >= 0.f)) c->delay_ms = 0.f;
+	if (c->delay_ms > 1000.f)  c->delay_ms = 1000.f;
 	if (c->join_waste < 0.f)   c->join_waste = 0.f;
 	if (c->join_waste > 4.f)   c->join_waste = 4.f;
 	if (c->section_cols < 1) c->section_cols = 1;
@@ -1021,6 +1036,7 @@ int bc_config_save(const struct bc_config *c)
 		"section_cols = %d   # detection grid across; >1 costs one inference per tile\n"
 		"section_rows = %d   # detection grid down\n"
 		"section_overlap = %.2f   # fraction of a tile shared with its neighbour\n"
+		"section_split = %s   # pick the tiles from the screen's shape (two on 16:9); cols, rows and overlap above are ignored while on\n"
 		"section_full_frame = %s   # also infer the whole screen, to catch what a tile cannot hold\n"
 		"censor_color = %s   # bar colour: auto (sampled from around it), a name, or #RRGGBB\n"
 		"outline    = %.1f   # px of outline around each cover, drawn outward; 0 = off\n"
@@ -1030,6 +1046,7 @@ int bc_config_save(const struct bc_config *c)
 		"growth     = %.1f   # %% per second each cover grows while on screen; 0 = off\n"
 		"growth_max = %.1f   # ceiling for growth, %%\n"
 		"takeover_ms = %.0f   # ms a detection must persist before the whole screen is covered; 0 = off\n"
+		"delay_ms   = %.0f   # show the screen this many ms behind, so each frame is censored from detections on both sides of it; 0 = live\n"
 		"\n[strength]\n"
 		"# Block size, blur radius, dot pitch -- one per effect, because they\n"
 		"# are different quantities and want different values. The active\n"
@@ -1050,10 +1067,12 @@ int bc_config_save(const struct bc_config *c)
 		bc_effect_name(c->effect), c->caption, c->text_color,
 		c->strength, c->confidence, c->dilate, c->sticky_ms, c->smoothing,
 		c->section_cols, c->section_rows, c->section_overlap,
+		c->section_split ? "true" : "false",
 		c->section_full_frame ? "true" : "false",
 		c->censor_color, c->outline, c->outline_color,
 		c->shadow, c->shadow_opacity,
-		c->growth, c->growth_max, c->takeover_ms, strengths, regions);
+		c->growth, c->growth_max, c->takeover_ms, c->delay_ms,
+		strengths, regions);
 
 	/*
 	 * A class pinned to an effect is written as that effect's name; every
@@ -1172,11 +1191,11 @@ int bc_config_load(struct bc_config *c, const char *path)
 	const int saw[] = { c->saw_smoothing, c->saw_join, c->saw_reverse,
 	                    c->saw_model, c->saw_eye_bar, c->saw_caption,
 	                    c->saw_text_color, c->saw_sections,
-	                    c->saw_full_frame, c->saw_shape,
+	                    c->saw_full_frame, c->saw_split, c->saw_shape,
 	                    c->saw_strengths, c->saw_grow,
 	                    c->saw_landmark, c->saw_lm_pad, c->saw_seg,
 	                    c->saw_bar_effect, c->saw_draw, c->saw_regions,
-	                    c->saw_bar_face };
+	                    c->saw_bar_face, c->saw_delay };
 	for (unsigned i = 0; i < sizeof saw / sizeof saw[0]; i++)
 		if (!saw[i])
 			missing++;

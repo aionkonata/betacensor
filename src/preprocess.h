@@ -54,6 +54,11 @@ int    bc_preproc_set_grid(struct bc_preproc *p, int cols, int rows,
                            float overlap, int full_frame);
 int    bc_preproc_tiles(const struct bc_preproc *p);
 
+/* Columns in the grid as set. The seam merge reads tile indices as
+ * row * cols + col, so it needs the grid actually in force, which is no longer
+ * always the one the config names. */
+int    bc_preproc_cols(const struct bc_preproc *p);
+
 /*
  * Replace the grid with `n` arbitrary source rectangles, one tile each, given
  * as x,y,w,h in source pixels. Each is fitted into the network input keeping

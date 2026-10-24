@@ -7,6 +7,7 @@
  */
 
 #include "offline.h"
+#include "landmark.h"
 #include "shaders.h"
 #include "font8x16.h"
 #include "util.h"
@@ -16,6 +17,7 @@
 #include <GL/gl.h>
 #include <GL/glext.h>
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,6 +67,9 @@ static const char *HARDEN_FS =
 "uniform float uAmp;\n"
 "uniform float uGlyph;\n"
 "uniform float uMark;\n"
+"uniform vec4  uBox;\n"
+"uniform float uAngle;\n"
+"uniform int   uTurned;\n"
 "out vec4 frag;\n"
 "uint pcg(uint v) {\n"
 "    uint s = v * 747796405u + 2891336453u;\n"
@@ -90,6 +95,19 @@ static const char *HARDEN_FS =
 "}\n"
 "void main() {\n"
 "    vec3  c    = texelFetch(uSrc, ivec2(gl_FragCoord.xy), 0).rgb;\n"
+"    if (uTurned == 1) {\n"
+"        /* The scissor is a turned box's bounding rectangle; only the\n"
+"           pixels inside the box itself are cover, and the rest are the\n"
+"           picture. Same rotation as the effect shader's. */\n"
+"        vec2  hs  = uBox.zw * 0.5;\n"
+"        vec2  rel = gl_FragCoord.xy - (uBox.xy + hs);\n"
+"        float cs = cos(-uAngle), sn = sin(-uAngle);\n"
+"        vec2  loc = vec2(rel.x * cs - rel.y * sn, rel.x * sn + rel.y * cs);\n"
+"        if (abs(loc.x) > hs.x || abs(loc.y) > hs.y) {\n"
+"            frag = vec4(c, 1.0);\n"
+"            return;\n"
+"        }\n"
+"    }\n"
 "    uvec2 cell = uvec2(floor(gl_FragCoord.xy / uBlock));\n"
 "    float lum  = r11(cell, 1u) * uAmp;\n"
 "    vec3  chro = vec3(r11(cell, 2u), r11(cell, 3u), r11(cell, 4u))\n"
@@ -296,6 +314,9 @@ int bc_off_gl_init(struct bc_off_gl *g, int w, int h)
 	g->h_amp   = glGetUniformLocation(g->harden, "uAmp");
 	g->h_glyph = glGetUniformLocation(g->harden, "uGlyph");
 	g->h_mark  = glGetUniformLocation(g->harden, "uMark");
+	g->h_box    = glGetUniformLocation(g->harden, "uBox");
+	g->h_angle  = glGetUniformLocation(g->harden, "uAngle");
+	g->h_turned = glGetUniformLocation(g->harden, "uTurned");
 
 	g->u_size     = glGetUniformLocation(g->prog, "uSize");
 	g->u_block    = glGetUniformLocation(g->prog, "uBlock");
@@ -357,6 +378,49 @@ void bc_off_upload(struct bc_off_gl *g, const unsigned char *rgb)
  * same feather for static. Anything that differs here is an effect that would
  * look different in a file than on screen.
  */
+/*
+ * The scissor for a box, in GL's bottom-up coordinates. An upright box is its
+ * own rectangle; a turned one needs its axis-aligned bound, because the
+ * shader draws the properly rotated rectangle and a scissor of the unrotated
+ * extent would cut its ends off -- the overlay learned that the hard way (see
+ * rot_scissor_box in overlay.c), at exactly the ends where an eye bar can
+ * least afford to lose coverage.
+ *
+ * A rectangle of half-size (hw, hh) turned by a has bound half-extents
+ *   ex = hw|cos a| + hh|sin a|,   ey = hw|sin a| + hh|cos a|.
+ */
+static void box_scissor(const struct bc_box *b, int gh, int *x, int *y,
+                        int *w, int *h)
+{
+	const int yb = gh - (b->y + b->h);
+	if (b->angle == 0.0f) {
+		*x = b->x; *y = yb; *w = b->w; *h = b->h;
+		return;
+	}
+	const float hw = b->w * 0.5f, hh = b->h * 0.5f;
+	const float ca = fabsf(cosf(b->angle)), sa = fabsf(sinf(b->angle));
+	const float ex = hw * ca + hh * sa, ey = hw * sa + hh * ca;
+	const float cx = b->x + hw, cy = (float)yb + hh;
+	*x = (int)(cx - ex) - 1;
+	*y = (int)(cy - ey) - 1;
+	*w = (int)(2.0f * ex) + 3;
+	*h = (int)(2.0f * ey) + 3;
+}
+
+int bc_off_box_has(const struct bc_box *b, int x, int y)
+{
+	if (b->angle == 0.0f)
+		return x >= b->x && y >= b->y && x < b->x + b->w &&
+		       y < b->y + b->h;
+	/* The shader's own test, in top-down pixels: into box space by -angle,
+	 * with y flipped because the angle is GL's, counter-clockwise from up. */
+	const float rx = (x + 0.5f) - (b->x + b->w * 0.5f);
+	const float ry = -((y + 0.5f) - (b->y + b->h * 0.5f));
+	const float cs = cosf(-b->angle), sn = sinf(-b->angle);
+	const float lx = rx * cs - ry * sn, ly = rx * sn + ry * cs;
+	return fabsf(lx) <= b->w * 0.5f && fabsf(ly) <= b->h * 0.5f;
+}
+
 /* The effect's block size for a box. One function, because the hardening
  * pass must land on exactly the grid the pixelate effect drew. */
 static float block_of(const struct bc_box *b)
@@ -391,12 +455,14 @@ void bc_off_draw(struct bc_off_gl *g, const struct bc_box *b, int n, double t)
 
 	for (int i = 0; i < n; i++) {
 		int y = g->h - (b[i].y + b[i].h);
-		glScissor(b[i].x, y, b[i].w, b[i].h);
+		int bx, by, bw, bh;
+		box_scissor(&b[i], g->h, &bx, &by, &bw, &bh);
+		glScissor(bx, by, bw, bh);
 
 		float block = block_of(&b[i]);
 
 		if (b[i].effect == BC_EFFECT_TAPE)
-			glScissor(0, y, g->w, b[i].h);
+			glScissor(0, by, g->w, bh);
 
 		float feather = 0.0f;
 		if (b[i].effect == BC_EFFECT_NOISE) {
@@ -404,8 +470,8 @@ void bc_off_draw(struct bc_off_gl *g, const struct bc_box *b, int n, double t)
 			if (feather < 6.0f)  feather = 6.0f;
 			if (feather > 40.0f) feather = 40.0f;
 			int f  = (int)feather + 1;
-			int sx = b[i].x - f, sy = y - f;
-			int sw = b[i].w + 2 * f, sh = b[i].h + 2 * f;
+			int sx = bx - f, sy = by - f;
+			int sw = bw + 2 * f, sh = bh + 2 * f;
 			if (sx < 0) { sw += sx; sx = 0; }
 			if (sy < 0) { sh += sy; sy = 0; }
 			if (sx + sw > g->w) sw = g->w - sx;
@@ -419,10 +485,12 @@ void bc_off_draw(struct bc_off_gl *g, const struct bc_box *b, int n, double t)
 		glUniform1i(g->u_effect, b[i].effect);
 		glUniform3f(g->u_color, 0.0f, 0.0f, 0.0f);
 		glUniform1f(g->u_time, (float)t);
+		/* The box as it is, not its bounding box: the shader rotates
+		 * into it and rejects what lies outside the turned rectangle. */
 		glUniform4f(g->u_box, (float)b[i].x, (float)y,
 		            (float)b[i].w, (float)b[i].h);
 		glUniform1f(g->u_feather, feather);
-		glUniform1f(g->u_angle, 0.0f);
+		glUniform1f(g->u_angle, b[i].angle);
 
 		GLint codes[64];
 		int   nc = 0;
@@ -518,9 +586,16 @@ void bc_off_harden(struct bc_off_gl *g, const struct bc_box *b, int n,
 		float glyph = (float)shortest / 110.0f;
 		if (glyph < 1.0f) glyph = 1.0f;
 		if (glyph > 8.0f) glyph = 8.0f;
-		glScissor(b[i].x, g->h - (b[i].y + b[i].h), b[i].w, b[i].h);
+		int sx, sy, sw, sh;
+		box_scissor(&b[i], g->h, &sx, &sy, &sw, &sh);
+		glScissor(sx, sy, sw, sh);
 		glUniform1f(g->h_block, block_of(&b[i]));
 		glUniform1f(g->h_glyph, glyph);
+		glUniform4f(g->h_box, (float)b[i].x,
+		            (float)(g->h - (b[i].y + b[i].h)), (float)b[i].w,
+		            (float)b[i].h);
+		glUniform1f(g->h_angle, b[i].angle);
+		glUniform1i(g->h_turned, b[i].angle != 0.0f);
 		glDrawArrays(GL_TRIANGLES, 0, 3);
 	}
 	glDisable(GL_SCISSOR_TEST);
@@ -562,6 +637,223 @@ uint64_t bc_off_run_seed(void)
 uint32_t bc_off_mix_seed(uint64_t run, uint64_t v)
 {
 	return (uint32_t)(mix64(run ^ mix64(v)) >> 16);
+}
+
+/* ------------------------------------------------------------------ */
+
+void bc_off_compose_alpha(const unsigned char *render, const unsigned char *flat,
+                          const unsigned char *rgba, int w, int h,
+                          const struct bc_box *boxes, int nb,
+                          unsigned char *out)
+{
+	const size_t px = (size_t)w * h;
+	for (size_t p = 0; p < px; p++) {
+		const int x = (int)(p % (size_t)w), y = (int)(p / (size_t)w);
+		int touched = memcmp(render + p * 3, flat + p * 3, 3) != 0;
+		for (int b = 0; b < nb && !touched; b++)
+			touched = bc_off_box_has(&boxes[b], x, y);
+		if (touched) {
+			memcpy(out + p * 4, render + p * 3, 3);
+			out[p * 4 + 3] = 255;
+		} else {
+			memcpy(out + p * 4, rgba + p * 4, 4);
+		}
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* Eye bar                                                             */
+
+#define EB_FACES 8   /* most faces handed to the landmark model at once */
+
+static void eb_drop_model(struct bc_off_eb *eb)
+{
+	if (eb->lm)
+		bc_landmark_destroy(eb->lm);
+	if (eb->lpp)
+		bc_preproc_destroy(eb->lpp);
+	free(eb->lt);
+	eb->lm = NULL;
+	eb->lpp = NULL;
+	eb->lt = NULL;
+}
+
+void bc_off_eb_free(struct bc_off_eb *eb)
+{
+	eb_drop_model(eb);
+}
+
+static int eb_model_ready(struct bc_off_eb *eb, const struct bc_config *cfg)
+{
+	const char *path = getenv("BC_LANDMARK_MODEL");
+	if (!path || !*path)
+		path = cfg->landmark_model;
+	if (!path || !*path) {
+		if (!eb->lm_warned) {
+			WARN("eye bar is on but no landmark_model is set -- bars will "
+			     "be the band across the face");
+			eb->lm_warned = 1;
+		}
+		return 0;
+	}
+	if (!strcmp(path, eb->lm_path))
+		return eb->lm != NULL;          /* already tried */
+
+	eb_drop_model(eb);
+	snprintf(eb->lm_path, sizeof eb->lm_path, "%s", path);
+	eb->lm = bc_landmark_create(path, 2);
+	if (!eb->lm) {
+		WARN("eye bar: could not load landmark model '%s' -- bars will be "
+		     "the band across the face", path);
+		return 0;
+	}
+	const int side = bc_landmark_input(eb->lm);
+	eb->lpp = bc_preproc_create(side, side);
+	/* ImageNet, as the model was trained. Getting this wrong does not
+	 * fail -- it just moves every point. */
+	static const float mean[3] = { 0.485f, 0.456f, 0.406f };
+	static const float sd[3]   = { 0.229f, 0.224f, 0.225f };
+	if (eb->lpp)
+		bc_preproc_set_norm(eb->lpp, mean, sd);
+	eb->lt = malloc((size_t)EB_FACES * 3 * (size_t)side * (size_t)side *
+	                sizeof *eb->lt);
+	if (!eb->lpp || !eb->lt) {
+		WARN("eye bar: landmark preprocessing could not be set up -- bars "
+		     "will be the band across the face");
+		eb_drop_model(eb);
+		return 0;
+	}
+	return 1;
+}
+
+void bc_off_eb_bars(struct bc_off_eb *eb, const struct bc_config *cfg,
+                    struct bc_off_gl *g, const struct bc_off_face *f, int n,
+                    struct bc_eyebar *bars, int *kind)
+{
+	if (n <= 0)
+		return;
+	const int have_lm = eb_model_ready(eb, cfg);
+	const int nofloor = getenv("BC_LM_NOFLOOR") != NULL;
+
+	for (int s = 0; s < n; s += EB_FACES) {
+		const int chunk = n - s < EB_FACES ? n - s : EB_FACES;
+		float rects[EB_FACES * 4];
+		int   ok[EB_FACES];
+		for (int m = 0; m < chunk; m++) {
+			/* Sized by the box's height, as live: height tracks the face
+			 * where width can take in ears and hair. */
+			const float side = f[s + m].h * BC_EB_LM_PAD;
+			ok[m] = side > 1.0f;
+			rects[m * 4 + 0] = f[s + m].x + f[s + m].w * 0.5f - side * 0.5f;
+			rects[m * 4 + 1] = f[s + m].y + f[s + m].h * 0.5f - side * 0.5f;
+			rects[m * 4 + 2] = side;
+			rects[m * 4 + 3] = side;
+		}
+		struct bc_lm_face lmo[EB_FACES];
+		int got = 0;
+		if (have_lm &&
+		    bc_preproc_set_rects(eb->lpp, rects, chunk) == 0 &&
+		    bc_preproc_run(eb->lpp, g->src_tex, g->w, g->h) == 0 &&
+		    bc_preproc_readback(eb->lpp, eb->lt) == 0)
+			got = bc_landmark_run(eb->lm, eb->lt, chunk, lmo, EB_FACES);
+		if (got != chunk)
+			got = 0;   /* all or nothing: a short answer is no answer */
+
+		for (int m = 0; m < chunk; m++) {
+			const int i = s + m;
+			kind[i] = BC_OFF_EB_BAND;
+			if (got && ok[m]) {
+				if (lmo[m].eye_score < BC_EB_LM_MIN_SCORE) {
+					eb->weak++;
+				} else {
+					float lx, ly, rx, ry, p0x, p0y, p1x, p1y;
+					bc_preproc_tile_to_screen(eb->lpp, m, lmo[m].lx,
+					                          lmo[m].ly, &lx, &ly);
+					bc_preproc_tile_to_screen(eb->lpp, m, lmo[m].rx,
+					                          lmo[m].ry, &rx, &ry);
+					/* Extents are in crop pixels; the same factor the
+					 * crop was scaled by brings them back. */
+					bc_preproc_tile_to_screen(eb->lpp, m, 0.0f, 0.0f,
+					                          &p0x, &p0y);
+					bc_preproc_tile_to_screen(eb->lpp, m, 1.0f, 1.0f,
+					                          &p1x, &p1y);
+					const float k = p1x - p0x;
+					const int r = bc_eyebar_from_eyes(
+					    lx, ly, rx, ry, lmo[m].ext_along * k,
+					    lmo[m].ext_across * k, cfg->lm_bar_pad, nofloor,
+					    f[i].x, f[i].y, f[i].w, f[i].h, &bars[i]);
+					if (r > 0)
+						kind[i] = BC_OFF_EB_EYES;
+					else if (r < 0)
+						eb->rejected++;
+				}
+			}
+			if (kind[i] == BC_OFF_EB_BAND) {
+				bc_eyebar_band(f[i].x, f[i].y, f[i].w, f[i].h,
+				               BC_EB_BAND_TOP, BC_EB_BAND_BOT, &bars[i]);
+				eb->bands++;
+			} else {
+				eb->bars++;
+			}
+		}
+	}
+}
+
+int bc_off_eb_box(const struct bc_config *cfg, int cls,
+                  const struct bc_off_face *face, const struct bc_eyebar *bar,
+                  float grow, int iw, int ih, struct bc_box *out)
+{
+	float cx = bar->cx, cy = bar->cy;
+	if (cfg->eye_bar_face) {
+		const float fcx = face->x + face->w * 0.5f;
+		const float fcy = face->y + face->h * 0.5f;
+		cx = fcx + (cx - fcx) * grow;
+		cy = fcy + (cy - fcy) * grow;
+	}
+	const float bw = bar->w * grow, bh = bar->h * grow;
+	/* The shader draws the turned rectangle, so there is nothing to clamp,
+	 * but a bar wholly off the image has nothing to draw. */
+	const float reach = hypotf(bw, bh) * 0.5f;
+	if (cx + reach < 0 || cy + reach < 0 || cx - reach > iw ||
+	    cy - reach > ih || bw < 1.0f || bh < 1.0f)
+		return 0;
+	const int ce = cfg->eye_bar_effect >= 0 ? cfg->eye_bar_effect
+	                                        : bc_cfg_class_effect(cfg, cls);
+	*out = bc_off_box_fx(cfg, ce, cls, (int)(cx - bw * 0.5f),
+	                     (int)(cy - bh * 0.5f), (int)bw, (int)bh);
+	out->angle = bar->angle;
+	/* On top of a face: caption only, no class name -- the face carries
+	 * that. On its own the bar is the cover and does. */
+	if (cfg->eye_bar_face)
+		snprintf(out->text, sizeof out->text, "%s", cfg->caption);
+	return 1;
+}
+
+int bc_off_drop_eyes(const struct bc_config *cfg, struct bc_det *d, int n,
+                     unsigned long *dropped)
+{
+	const int eye = bc_class_index("EYE");
+	if (!cfg->eye_bar || eye < 0)
+		return n;
+	int out = 0;
+	for (int i = 0; i < n; i++) {
+		int under = 0;
+		if (d[i].cls == eye) {
+			const float cx = d[i].x + d[i].w * 0.5f;
+			const float cy = d[i].y + d[i].h * 0.5f;
+			for (int j = 0; j < n && !under; j++)
+				if (j != i && bc_is_head_class(bc_class_name(d[j].cls)))
+					under = cx >= d[j].x && cx <= d[j].x + d[j].w &&
+					        cy >= d[j].y && cy <= d[j].y + d[j].h;
+		}
+		if (under) {
+			if (dropped)
+				(*dropped)++;
+			continue;
+		}
+		d[out++] = d[i];
+	}
+	return out;
 }
 
 /* ------------------------------------------------------------------ */
@@ -781,7 +1073,12 @@ struct bc_box bc_off_box(const struct bc_config *cfg, int cls,
 {
 	/* This box's own effect, from its class -- the live path does the
 	 * same, and an offline render of the same config has to match it. */
-	int ce = bc_cfg_class_effect(cfg, cls);
+	return bc_off_box_fx(cfg, bc_cfg_class_effect(cfg, cls), cls, x, y, w, h);
+}
+
+struct bc_box bc_off_box_fx(const struct bc_config *cfg, int ce, int cls,
+                            int x, int y, int w, int h)
+{
 	struct bc_box b = {
 		.x = x, .y = y, .w = w, .h = h,
 		.effect = bc_off_effect(ce),

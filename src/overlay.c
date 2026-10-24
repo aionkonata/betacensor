@@ -127,6 +127,8 @@ struct bc_overlay {
 	 */
 	double   t0;
 	unsigned src_tex;
+	GLuint   bg_prog;       /* full-screen blit of the source, for the delayed screen */
+	int      bg_on;
 	int      src_w, src_h;
 
 	/*
@@ -807,6 +809,23 @@ static int egl_setup(struct bc_overlay *o)
 		ERR("could not build the pixelate program");
 		return -1;
 	}
+	{
+		static const char *BG_FS =
+"#version 430 core\n"
+"layout(binding = 0) uniform sampler2D uSrc;\n"
+"uniform vec2 uSize;\n"
+"uniform float uA;\n"
+"out vec4 frag;\n"
+"void main() {\n"
+"    vec2 uv = vec2(gl_FragCoord.x / uSize.x, 1.0 - gl_FragCoord.y / uSize.y);\n"
+"    frag = vec4(texture(uSrc, uv).rgb * uA, uA);\n"
+"}\n";
+		o->bg_prog = build_program(BC_VS_SRC, BG_FS);
+		if (!o->bg_prog) {
+			ERR("could not build the background blit program");
+			return -1;
+		}
+	}
 	o->u_size  = glGetUniformLocation(o->pix_prog, "uSize");
 	o->u_block = glGetUniformLocation(o->pix_prog, "uBlock");
 	o->u_alpha = glGetUniformLocation(o->pix_prog, "uAlpha");
@@ -1286,6 +1305,12 @@ void bc_overlay_set_silhouette(struct bc_overlay *o, const unsigned char *px,
 	o->mask_rect[3] = v1;
 }
 
+void bc_overlay_set_background(struct bc_overlay *o, int on)
+{
+	if (o)
+		o->bg_on = on;
+}
+
 int bc_overlay_present(struct bc_overlay *o, const struct bc_box *boxes, int n)
 {
 	if (!o)
@@ -1314,6 +1339,24 @@ int bc_overlay_present(struct bc_overlay *o, const struct bc_box *boxes, int n)
 	 */
 	glEnable(GL_BLEND);
 	glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+
+	/*
+	 * The delayed screen: the source frame, opaque, over the whole output and
+	 * beneath every box. Under KWin an opaque surface used to stop the
+	 * compositor repainting what was behind it, which starved the capture; with
+	 * the overlay hidden from the screencast it does not (measured: capture
+	 * rate 130/s against 141/s with nothing drawn, 0% identical frames).
+	 */
+	if (o->bg_on && o->bg_prog && o->src_tex) {
+		glUseProgram(o->bg_prog);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, o->src_tex);
+		glUniform2f(glGetUniformLocation(o->bg_prog, "uSize"),
+		            (float)o->buf_w, (float)o->buf_h);
+		glUniform1f(glGetUniformLocation(o->bg_prog, "uA"), 1.0f);
+		glBindVertexArray(o->vao);
+		glDrawArrays(GL_TRIANGLES, 0, 3);
+	}
 
 	/*
 	 * Reverse mode. The mask is one box covering the whole output, drawn

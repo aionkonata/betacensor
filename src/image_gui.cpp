@@ -60,7 +60,12 @@
 #include <QRandomGenerator>
 #include <QShortcut>
 #include <QCloseEvent>
+#include <QFile>
+#include <QMouseEvent>
+#include <QSaveFile>
 #include <QSignalBlocker>
+
+#include <cmath>
 #include <QVector>
 
 #include <algorithm>
@@ -156,10 +161,19 @@ struct Preview {
 	QString path;
 	int     w = 0, h = 0;
 	bool    animated = false;
-	QVector<QRect> covers;          /* exactly where effects are drawn */
+	/* Exactly where effects are drawn. An eye bar is turned to the eye
+	 * line, so a cover is a rectangle and an angle (radians, GL's:
+	 * counter-clockwise on screen). */
+	struct Cover {
+		QRect  r;
+		double angle;
+		bool   manual;          /* drawn by the user, not found */
+	};
+	QVector<Cover> covers;
 	struct Det {
 		QRect   r;
-		bool    covered;
+		int     state;          /* 1 covered, 0 found but not ticked,
+		                         * 2 covered until the user removed it */
 		double  score;
 		QString name;
 	};
@@ -223,8 +237,14 @@ public:
 			return;
 		closing_ = false;
 		stderrTail_.clear();
-		proc_->start(binary_, { "--serve" });
+		QStringList args{ "--serve" };
+		/* The same file the batch reads, so what is previewed is what is
+		 * written. The server re-reads it when it changes. */
+		if (!editsPath_.isEmpty())
+			args << "--edits" << editsPath_;
+		proc_->start(binary_, args);
 	}
+	void setEditsPath(const QString &p) { editsPath_ = p; }
 	void stop()
 	{
 		if (proc_->state() == QProcess::NotRunning)
@@ -308,10 +328,11 @@ private:
 				const QRect r(f.value(1).toInt(), f.value(2).toInt(),
 				              f.value(3).toInt(), f.value(4).toInt());
 				if (f.value(0) == "B")
-					cur_.covers << r;
+					cur_.covers << Preview::Cover{
+					    r, f.value(5).toDouble(), f.value(6) == "1" };
 				else if (f.value(0) == "D")
 					cur_.dets << Preview::Det{
-					    r, f.value(5) == "1", f.value(6).toDouble(),
+					    r, f.value(5).toInt(), f.value(6).toDouble(),
 					    QString::fromUtf8(f.value(7)) };
 				if (--linesLeft_ == 0)
 					state_ = Pixels;
@@ -339,7 +360,7 @@ private:
 		}
 	}
 
-	QString    binary_;
+	QString    binary_, editsPath_;
 	QProcess  *proc_;
 	QByteArray buf_, stderrTail_;
 	State      state_ = WaitReady;
@@ -358,11 +379,25 @@ private:
  * rectangles (after growth and joining); detections are the model's boxes
  * behind them, so the gap between the two is the dilation.
  */
+
 class Canvas : public QWidget {
 public:
 	bool showDetections = false;
 	bool actualSize = false;
 	const Preview *pv = nullptr;
+	/* A drag that drew a rectangle, and a click that did not (image px). */
+	std::function<void(const QRect &)> onDrawRect = [](const QRect &) {};
+	std::function<void(const QPoint &)> onClick = [](const QPoint &) {};
+
+	Canvas() { setCursor(Qt::CrossCursor); }
+
+	/* Image pixel -> widget pixel, from the last paint. For the debug hook,
+	 * which drives the real mouse path. */
+	QPointF toWidget(const QPointF &imagePx) const
+	{
+		return QPointF(dst_.x() + imagePx.x() * scale_,
+		               dst_.y() + imagePx.y() * scale_);
+	}
 
 	QSize sizeHint() const override
 	{
@@ -370,6 +405,49 @@ public:
 	}
 
 protected:
+	/* Widget pixel -> image pixel, from the last paint's placement. */
+	QPoint toImage(const QPointF &w) const
+	{
+		return QPoint(int(std::floor((w.x() - dst_.x()) / scale_)),
+		              int(std::floor((w.y() - dst_.y()) / scale_)));
+	}
+
+	void mousePressEvent(QMouseEvent *e) override
+	{
+		if (e->button() != Qt::LeftButton || !pv || pv->original.isNull())
+			return;
+		dragging_ = true;
+		from_ = to_ = e->position();
+		update();
+	}
+	void mouseMoveEvent(QMouseEvent *e) override
+	{
+		if (!dragging_)
+			return;
+		to_ = e->position();
+		update();
+	}
+	void mouseReleaseEvent(QMouseEvent *e) override
+	{
+		if (!dragging_ || e->button() != Qt::LeftButton)
+			return;
+		dragging_ = false;
+		to_ = e->position();
+		update();
+		if (!pv || scale_ <= 0.0)
+			return;
+		const QPointF d = to_ - from_;
+		/* A few pixels of wobble is still a click. */
+		if (std::abs(d.x()) < 5 && std::abs(d.y()) < 5) {
+			onClick(toImage(from_));
+			return;
+		}
+		QRect r = QRect(toImage(from_), toImage(to_)).normalized();
+		r = r.intersected(QRect(0, 0, pv->w, pv->h));
+		if (r.width() >= 4 && r.height() >= 4)
+			onDrawRect(r);
+	}
+
 	void paintEvent(QPaintEvent *) override
 	{
 		QPainter p(this);
@@ -387,35 +465,64 @@ protected:
 			const double w = pv->w * s, h = pv->h * s;
 			dst = QRectF((width() - w) / 2, (height() - h) / 2, w, h);
 		}
+		dst_ = dst;
+		scale_ = s;
 		p.setRenderHint(QPainter::SmoothPixmapTransform, s < 1.0);
 		p.drawImage(dst, img);
-		if (!showDetections)
-			return;
 
-		p.setRenderHint(QPainter::Antialiasing);
 		auto map = [&dst, s](const QRect &r) {
 			return QRectF(dst.x() + r.x() * s, dst.y() + r.y() * s,
 			              r.width() * s, r.height() * s);
 		};
+		p.setRenderHint(QPainter::Antialiasing);
+		if (showDetections)
+			paintDetections(p, map);
+
+		/* The rectangle being drawn, over either view. */
+		if (dragging_) {
+			p.setBrush(QColor(0, 190, 255, 50));
+			p.setPen(QPen(QColor(0, 190, 255), 2, Qt::DashLine));
+			p.drawRect(QRectF(from_, to_).normalized());
+		}
+	}
+
+private:
+	template <typename Map>
+	void paintDetections(QPainter &p, Map map)
+	{
+		const QColor red(230, 30, 40), amber(255, 190, 0),
+		             grey(150, 150, 150), green(0, 190, 90);
 		/* Uncovered first, so a covered box is never drawn under one. */
 		QFont f = font();
 		f.setBold(true);
 		p.setFont(f);
 		for (const auto &d : pv->dets) {
-			if (d.covered)
+			if (d.state == 1)
 				continue;
-			QPen pen(QColor(255, 190, 0), 2, Qt::DashLine);
-			p.setPen(pen);
+			p.setPen(QPen(d.state == 2 ? grey : amber, 2, Qt::DashLine));
 			p.setBrush(Qt::NoBrush);
 			p.drawRect(map(d.r));
 		}
-		for (const QRect &c : pv->covers) {
-			p.setPen(QPen(QColor(230, 30, 40), 2));
-			p.setBrush(QColor(230, 30, 40, 70));
-			p.drawRect(map(c));
+		for (const auto &c : pv->covers) {
+			const QColor col = c.manual ? green : red;
+			p.setPen(QPen(col, 2));
+			p.setBrush(QColor(col.red(), col.green(), col.blue(), 70));
+			const QRectF m = map(c.r);
+			if (c.angle == 0.0) {
+				p.drawRect(m);
+				continue;
+			}
+			/* Turned about its centre. Qt's y points down, so GL's
+			 * counter-clockwise angle is a negative Qt rotation. */
+			p.save();
+			p.translate(m.center());
+			p.rotate(-c.angle * 57.29577951308232);
+			p.drawRect(QRectF(-m.width() / 2, -m.height() / 2, m.width(),
+			                  m.height()));
+			p.restore();
 		}
 		for (const auto &d : pv->dets) {
-			if (!d.covered)
+			if (d.state != 1)
 				continue;
 			p.setPen(QPen(QColor(255, 255, 255, 200), 1, Qt::DotLine));
 			p.setBrush(Qt::NoBrush);
@@ -424,22 +531,210 @@ protected:
 		/* Labels last, on a backing so they read on any image. */
 		const QFontMetrics fm(f);
 		for (const auto &d : pv->dets) {
-			const QString t = QString("%1 %2").arg(d.name)
-			                      .arg(d.score, 0, 'f', 2);
+			QString t = QString("%1 %2").arg(d.name).arg(d.score, 0, 'f', 2);
+			if (d.state == 2)
+				t += " — removed";
 			const QRectF r = map(d.r);
 			QRectF lab(r.x(), r.y() - fm.height() - 2,
 			           fm.horizontalAdvance(t) + 8, fm.height() + 2);
-			if (lab.y() < dst.y())
+			if (lab.y() < dst_.y())
 				lab.moveTop(r.y());
 			p.setPen(Qt::NoPen);
-			p.setBrush(d.covered ? QColor(230, 30, 40, 220)
-			                     : QColor(255, 190, 0, 220));
+			p.setBrush(d.state == 1 ? QColor(230, 30, 40, 220)
+			         : d.state == 2 ? QColor(120, 120, 120, 220)
+			                        : QColor(255, 190, 0, 220));
 			p.drawRect(lab);
-			p.setPen(d.covered ? Qt::white : Qt::black);
+			p.setPen(d.state == 0 ? Qt::black : Qt::white);
+			p.drawText(lab.adjusted(4, 0, 0, 0),
+			           Qt::AlignVCenter | Qt::AlignLeft, t);
+		}
+		/* Hand-drawn covers carry no detection to label; say what they are. */
+		for (const auto &c : pv->covers) {
+			if (!c.manual)
+				continue;
+			const QRectF m = map(c.r);
+			const QString t = "drawn by you — click to remove";
+			QRectF lab(m.x(), m.y() - fm.height() - 2,
+			           fm.horizontalAdvance(t) + 8, fm.height() + 2);
+			if (lab.y() < dst_.y())
+				lab.moveTop(m.y());
+			p.setPen(Qt::NoPen);
+			p.setBrush(QColor(0, 150, 70, 230));
+			p.drawRect(lab);
+			p.setPen(Qt::white);
 			p.drawText(lab.adjusted(4, 0, 0, 0),
 			           Qt::AlignVCenter | Qt::AlignLeft, t);
 		}
 	}
+
+	QRectF  dst_;
+	double  scale_ = 1.0;
+	bool    dragging_ = false;
+	QPointF from_, to_;
+};
+
+/* ------------------------------------------------------------------ */
+
+/*
+ * The edits made by hand in the preview, kept between sessions in a file the
+ * batch reads too (the format is documented at edits_load() in image.c).
+ * Per image, keyed by canonical path and the image's pixel size: a different
+ * file under the same name would otherwise inherit coordinates that mean
+ * nothing on it.
+ */
+class EditStore {
+public:
+	struct Op {
+		bool  add;       /* a drawn cover; else a removal point */
+		QRect r;         /* the cover; for a removal, x and y are the point */
+	};
+	struct Img {
+		int         w = 0, h = 0;
+		QVector<Op> ops;
+	};
+
+	explicit EditStore(QString file) : file_(std::move(file)) { load(); }
+	const QString &file() const { return file_; }
+
+	static QString keyOf(const QString &path)
+	{
+		const QString c = QFileInfo(path).canonicalFilePath();
+		return c.isEmpty() ? QFileInfo(path).absoluteFilePath() : c;
+	}
+	/* The tab-separated file cannot carry a name with a tab or newline. */
+	static bool storable(const QString &key)
+	{
+		return !key.contains('\t') && !key.contains('\n');
+	}
+
+	/* This image's edits, started afresh if its size is not the one they
+	 * were made at. */
+	Img &at(const QString &path, int w, int h)
+	{
+		Img &i = imgs_[keyOf(path)];
+		if (i.w != w || i.h != h) {
+			i.ops.clear();
+			i.w = w;
+			i.h = h;
+		}
+		return i;
+	}
+	const Img *find(const QString &path) const
+	{
+		auto it = imgs_.constFind(keyOf(path));
+		return it == imgs_.constEnd() ? nullptr : &*it;
+	}
+	int editCount(const QString &path) const
+	{
+		const Img *i = find(path);
+		return i ? int(i->ops.size()) : 0;
+	}
+	int imagesEdited() const
+	{
+		int n = 0;
+		for (auto it = imgs_.constBegin(); it != imgs_.constEnd(); ++it)
+			n += !it->ops.isEmpty();
+		return n;
+	}
+
+	void addRect(const QString &path, int w, int h, const QRect &r)
+	{
+		at(path, w, h).ops.append({ true, r });
+		save();
+	}
+	void addDrop(const QString &path, int w, int h, const QPoint &pt)
+	{
+		at(path, w, h).ops.append({ false, QRect(pt.x(), pt.y(), 0, 0) });
+		save();
+	}
+	/* Take back a drawn cover (by its rectangle). */
+	bool removeRect(const QString &path, int w, int h, const QRect &r)
+	{
+		Img &i = at(path, w, h);
+		for (int k = int(i.ops.size()) - 1; k >= 0; k--)
+			if (i.ops[k].add && i.ops[k].r == r) {
+				i.ops.remove(k);
+				save();
+				return true;
+			}
+		return false;
+	}
+	/* Bring back whatever a click inside `area` removed. */
+	int removeDropsIn(const QString &path, int w, int h, const QRect &area)
+	{
+		Img &i = at(path, w, h);
+		int n = 0;
+		for (int k = int(i.ops.size()) - 1; k >= 0; k--)
+			if (!i.ops[k].add && area.contains(i.ops[k].r.topLeft())) {
+				i.ops.remove(k);
+				n++;
+			}
+		if (n)
+			save();
+		return n;
+	}
+	void undoLast(const QString &path, int w, int h)
+	{
+		Img &i = at(path, w, h);
+		if (!i.ops.isEmpty()) {
+			i.ops.removeLast();
+			save();
+		}
+	}
+	void clear(const QString &path, int w, int h)
+	{
+		at(path, w, h).ops.clear();
+		save();
+	}
+
+private:
+	void load()
+	{
+		QFile f(file_);
+		if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+			return;
+		while (!f.atEnd()) {
+			const QStringList c = QString::fromUtf8(f.readLine())
+			    .trimmed().split('\t');
+			if (c.size() < 4)
+				continue;
+			const QStringList wh = c[1].split('x');
+			if (wh.size() != 2)
+				continue;
+			Img &i = imgs_[c[0]];
+			i.w = wh[0].toInt();
+			i.h = wh[1].toInt();
+			if (c[2] == "add" && c.size() >= 7)
+				i.ops.append({ true, QRect(c[3].toInt(), c[4].toInt(),
+				                           c[5].toInt(), c[6].toInt()) });
+			else if (c[2] == "drop" && c.size() >= 5)
+				i.ops.append({ false, QRect(c[3].toInt(), c[4].toInt(), 0, 0) });
+		}
+	}
+	/* Whole file, atomically: bc-image may read it between any two writes. */
+	void save()
+	{
+		QSaveFile f(file_);
+		if (!f.open(QIODevice::WriteOnly | QIODevice::Text))
+			return;
+		for (auto it = imgs_.constBegin(); it != imgs_.constEnd(); ++it) {
+			if (!storable(it.key()))
+				continue;
+			for (const Op &o : it->ops) {
+				QString line = QString("%1\t%2x%3\t").arg(it.key())
+				                   .arg(it->w).arg(it->h);
+				line += o.add
+				    ? QString("add\t%1\t%2\t%3\t%4").arg(o.r.x()).arg(o.r.y())
+				          .arg(o.r.width()).arg(o.r.height())
+				    : QString("drop\t%1\t%2").arg(o.r.x()).arg(o.r.y());
+				f.write(line.toUtf8() + '\n');
+			}
+		}
+		f.commit();
+	}
+
+	QString               file_;
+	QHash<QString, Img>   imgs_;
 };
 
 /* ------------------------------------------------------------------ */
@@ -502,6 +797,38 @@ public:
 		scroll_->setWidgetResizable(true);
 		scroll_->setAlignment(Qt::AlignCenter);
 		root->addWidget(scroll_, 1);
+
+		/*
+		 * Hand edits. The detector misses things and sometimes finds what is
+		 * not there; both are fixed here, per image, and the batch writes
+		 * what is shown. Fail-closed is why drawing is the easy gesture and
+		 * removing is an explicit click on the thing itself.
+		 */
+		auto *hint = new QLabel(
+		    "<i>Drag on the image to cover something it missed · click a "
+		    "cover to remove it · click a removed one to bring it back</i>");
+		hint->setWordWrap(true);
+		root->addWidget(hint);
+		auto *editRow = new QHBoxLayout;
+		undoBtn_ = new QPushButton("Undo last edit");
+		clearBtn_ = new QPushButton("Clear edits on this image");
+		editsLabel_ = new QLabel;
+		editRow->addWidget(undoBtn_);
+		editRow->addWidget(clearBtn_);
+		editRow->addWidget(editsLabel_, 1);
+		root->addLayout(editRow);
+		QObject::connect(undoBtn_, &QPushButton::clicked, [this] {
+			if (haveImage())
+				store_->undoLast(pv_.path, pv_.w, pv_.h);
+			edited();
+		});
+		QObject::connect(clearBtn_, &QPushButton::clicked, [this] {
+			if (haveImage())
+				store_->clear(pv_.path, pv_.w, pv_.h);
+			edited();
+		});
+		canvas_->onClick = [this](const QPoint &pt) { clickAt(pt); };
+		canvas_->onDrawRect = [this](const QRect &r) { drawn(r); };
 
 		status_ = new QLabel("Loading the model…");
 		status_->setWordWrap(true);
@@ -601,7 +928,36 @@ public:
 	{
 		(on ? viewDets_ : viewCensored_)->click();
 	}
+	/* The edits this window makes and its server reads. Set before the
+	 * first show: the server is started with the store's file. */
+	void setStore(EditStore *s)
+	{
+		store_ = s;
+		server_.setEditsPath(s ? s->file() : QString());
+	}
+	/*
+	 * DEBUG ONLY: a left-button press at `from` and release at `to` (image
+	 * pixels), sent as real mouse events to the canvas -- so a test drives
+	 * the same path a hand does, coordinate mapping included. A click is
+	 * from == to.
+	 */
+	void debugMouse(const QPointF &from, const QPointF &to)
+	{
+		const QPointF a = canvas_->toWidget(from), b = canvas_->toWidget(to);
+		auto ev = [this](QEvent::Type t, const QPointF &p) {
+			QMouseEvent e(t, p, canvas_->mapToGlobal(p), Qt::LeftButton,
+			              t == QEvent::MouseButtonRelease ? Qt::NoButton
+			                                              : Qt::LeftButton,
+			              Qt::NoModifier);
+			QApplication::sendEvent(canvas_, &e);
+		};
+		ev(QEvent::MouseButtonPress, a);
+		ev(QEvent::MouseMove, b);
+		ev(QEvent::MouseButtonRelease, b);
+	}
 	std::function<void()> shown = [] {};
+	/* Edits changed (here, or Clear): the main window may want to say so. */
+	std::function<void()> editsChanged = [] {};
 
 protected:
 	void closeEvent(QCloseEvent *e) override
@@ -611,6 +967,96 @@ protected:
 	}
 
 private:
+	bool haveImage() const { return have_ && store_ && pv_.w > 0; }
+
+	/* Is the image pixel (x, y) inside this cover, turned as it is? The
+	 * shader's own test, as bc_off_box_has() makes it. */
+	static bool coverHas(const Preview::Cover &c, const QPoint &p)
+	{
+		if (c.angle == 0.0)
+			return c.r.contains(p);
+		const double rx = p.x() + 0.5 - (c.r.x() + c.r.width() * 0.5);
+		const double ry = -(p.y() + 0.5 - (c.r.y() + c.r.height() * 0.5));
+		const double cs = std::cos(-c.angle), sn = std::sin(-c.angle);
+		const double lx = rx * cs - ry * sn, ly = rx * sn + ry * cs;
+		return std::abs(lx) <= c.r.width() * 0.5 &&
+		       std::abs(ly) <= c.r.height() * 0.5;
+	}
+
+	void edited()
+	{
+		updateEditsUi();
+		editsChanged();
+		refresh();
+	}
+
+	void updateEditsUi()
+	{
+		const int n = haveImage() ? store_->editCount(pv_.path) : 0;
+		undoBtn_->setEnabled(n > 0);
+		clearBtn_->setEnabled(n > 0);
+		editsLabel_->setText(n ? QString("<b>%1 hand edit%2 on this image</b>")
+		                             .arg(n).arg(n == 1 ? "" : "s")
+		                       : QString());
+	}
+
+	/* A click: remove the cover under it, or bring back a removed one. */
+	void clickAt(const QPoint &pt)
+	{
+		if (!haveImage()) {
+			status_->setText("Nothing loaded yet.");
+			return;
+		}
+		if (!EditStore::storable(EditStore::keyOf(pv_.path))) {
+			status_->setText("<b>This file's name has a tab or line break in "
+			                 "it, so edits cannot be saved for it.</b>");
+			return;
+		}
+		/* A cover drawn by hand is taken back; later ones sit on top. */
+		for (int i = int(pv_.covers.size()) - 1; i >= 0; i--) {
+			const auto &c = pv_.covers[i];
+			if (c.manual && coverHas(c, pt)) {
+				store_->removeRect(pv_.path, pv_.w, pv_.h, c.r);
+				edited();
+				return;
+			}
+		}
+		/* A found cover is removed -- as the point, so it still holds if the
+		 * classes or the effect change and the boxes move. */
+		for (const auto &c : pv_.covers)
+			if (!c.manual && coverHas(c, pt)) {
+				store_->addDrop(pv_.path, pv_.w, pv_.h, pt);
+				edited();
+				return;
+			}
+		/* One you removed earlier comes back. */
+		for (const auto &d : pv_.dets)
+			if (d.state == 2) {
+				const int m = std::max(6, std::max(d.r.width(), d.r.height()) / 6);
+				const QRect a = d.r.adjusted(-m, -m, m, m);
+				if (a.contains(pt) &&
+				    store_->removeDropsIn(pv_.path, pv_.w, pv_.h, a)) {
+					edited();
+					return;
+				}
+			}
+		status_->setText("Nothing to remove there. Drag on the image to draw "
+		                 "a cover.");
+	}
+
+	void drawn(const QRect &r)
+	{
+		if (!haveImage())
+			return;
+		if (!EditStore::storable(EditStore::keyOf(pv_.path))) {
+			status_->setText("<b>This file's name has a tab or line break in "
+			                 "it, so edits cannot be saved for it.</b>");
+			return;
+		}
+		store_->addRect(pv_.path, pv_.w, pv_.h, r);
+		edited();
+	}
+
 	void step(int d)
 	{
 		if (files_.isEmpty())
@@ -652,10 +1098,14 @@ private:
 			canvas_->resize(pv_.w, pv_.h);
 		canvas_->update();
 
-		QStringList cov, unc;
+		QStringList cov, unc, gone;
 		for (const auto &d : pv_.dets)
-			(d.covered ? cov : unc) << QString("%1 %2").arg(d.name)
-			                               .arg(d.score, 0, 'f', 2);
+			(d.state == 1 ? cov : d.state == 2 ? gone : unc)
+			    << QString("%1 %2").arg(d.name).arg(d.score, 0, 'f', 2);
+		int drawnByHand = 0;
+		for (const auto &c : pv_.covers)
+			drawnByHand += c.manual;
+		updateEditsUi();
 		QString s = QString("<b>%1</b> — %2 × %3. ")
 		                .arg(QFileInfo(pv_.path).fileName().toHtmlEscaped())
 		                .arg(pv_.w).arg(pv_.h);
@@ -666,11 +1116,19 @@ private:
 		          .arg(pv_.covers.size() == 1 ? "" : "s");
 		if (!cov.isEmpty())
 			s += ": " + cov.join(", ");
+		if (drawnByHand)
+			s += QString("<br><span style='color:#007a3a'>%1 drawn by you."
+			             "</span>").arg(drawnByHand);
+		if (!gone.isEmpty())
+			s += "<br><span style='color:#777'>Removed by you: " +
+			     gone.join(", ") + "</span>";
 		if (!unc.isEmpty())
 			s += "<br><span style='color:#b07800'>Found but not ticked: " +
 			     unc.join(", ") + "</span>";
 		if (pv_.animated)
-			s += "<br><i>Animated: only the first frame is censored.</i>";
+			s += "<br><i>Animated: the whole animation is censored, "
+			     "with tracking between frames. This shows its first "
+			     "frame; edits you make here apply to every frame.</i>";
 		status_->setText(s);
 		shown();
 	}
@@ -685,6 +1143,9 @@ private:
 	Preview       pv_;
 	bool          have_ = false;
 	QRadioButton *viewCensored_ = nullptr, *viewDets_ = nullptr;
+	EditStore    *store_ = nullptr;
+	QPushButton  *undoBtn_ = nullptr, *clearBtn_ = nullptr;
+	QLabel       *editsLabel_ = nullptr;
 };
 
 QString imageBinary()
@@ -926,6 +1387,16 @@ int main(int argc, char **argv)
 	auto *preview = new PreviewWindow(&win, imageBinary());
 	win.installEventFilter(new CloseWatch([preview] { preview->close(); },
 	                                      &win));
+	/*
+	 * Hand edits from the preview, kept in the project directory beside the
+	 * config (the launcher runs the panel from there) and handed to every
+	 * bc-image this panel starts, preview server and batch alike.
+	 */
+	const QString editsFile = qEnvironmentVariableIsEmpty("BC_IMAGE_EDITS")
+	    ? QDir::current().absoluteFilePath("betacensor-image-edits.tsv")
+	    : QString::fromLocal8Bit(qgetenv("BC_IMAGE_EDITS"));
+	auto *edits = new EditStore(editsFile);
+	preview->setStore(edits);
 	preview->inputs = [list] { return list->paths(); };
 	preview->flags = [harden, badge] {
 		QString f;
@@ -1086,7 +1557,7 @@ int main(int argc, char **argv)
 
 	QObject::connect(start, &QPushButton::clicked,
 	                 [&win, proc, list, outEdit, format, overwrite, classes,
-	                  harden, badge, log, bar, start, stop] {
+	                  harden, badge, edits, log, bar, start, stop] {
 		const QStringList in = list->paths();
 		const QString out = outEdit->text().trimmed();
 		if (in.isEmpty() || out.isEmpty()) {
@@ -1127,6 +1598,11 @@ int main(int argc, char **argv)
 			args << "--no-harden";
 		if (!badge->isChecked())
 			args << "--no-badge";
+		/* What was drawn and removed by hand in the preview. Passed whenever
+		 * there are any: they only touch the images they were made on. */
+		const int edited = edits->imagesEdited();
+		if (edited)
+			args << "--edits" << edits->file();
 		/* "--" so an input whose name starts with '-' is not read as
 		 * an option. */
 		args << "--" << in;
@@ -1135,6 +1611,10 @@ int main(int argc, char **argv)
 		bar->setValue(0);
 		start->setEnabled(false);
 		stop->setEnabled(true);
+		if (edited)
+			log->appendPlainText(
+			    QString("-- applying your hand edits on %1 image%2 --")
+			        .arg(edited).arg(edited == 1 ? "" : "s"));
 		log->appendPlainText(
 		    QString("$ bc-image --classes <%1 of %2> %3 -- <%4 input%5>")
 		        .arg(picked.size()).arg(classes->size())
@@ -1241,13 +1721,32 @@ int main(int argc, char **argv)
 			 * class after the first image, shooting the redraw. */
 			const QString untick = QString::fromLocal8Bit(
 			    qgetenv("BC_IMAGE_GUI_PREVIEW_UNTICK"));
+			/*
+			 * BC_IMAGE_GUI_PREVIEW_MOUSE="x0,y0,x1,y1;..." drives the real
+			 * mouse path after the first image: each item is a press at
+			 * (x0,y0) and a release at (x1,y1) in image pixels -- a click
+			 * when they are equal, a drawn rectangle when not. One item is
+			 * played per result, and the shot is taken after the last.
+			 */
+			const QStringList mouse = QString::fromLocal8Bit(
+			    qgetenv("BC_IMAGE_GUI_PREVIEW_MOUSE"))
+			        .split(';', Qt::SkipEmptyParts);
 			auto *seen = new int(0);
-			preview->shown = [preview, path, untick, classes, seen] {
+			preview->shown = [preview, path, untick, classes, seen, mouse] {
 				if (!untick.isEmpty() && (*seen)++ == 0) {
 					for (auto &c : *classes)
 						if (c.name == untick)
 							c.box->setChecked(false);
 					return;
+				}
+				if (!mouse.isEmpty() && *seen < mouse.size()) {
+					const QStringList v = mouse[(*seen)++].split(',');
+					if (v.size() == 4) {
+						preview->debugMouse(
+						    QPointF(v[0].toDouble(), v[1].toDouble()),
+						    QPointF(v[2].toDouble(), v[3].toDouble()));
+						return;
+					}
 				}
 				QTimer::singleShot(300, [preview, path] {
 					preview->grab().save(path);

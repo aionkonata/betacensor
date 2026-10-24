@@ -1859,6 +1859,18 @@ int main(int argc, char **argv)
 		  "when the detector briefly loses track; too high and covers hang "
 		  "around over content that has already gone. 1000 = one second.",
 		  0, 5000, 10, 0 },
+		{ "delay_ms",   "Screen delay (milliseconds)",
+		  "Shows the screen this far behind real time, so every frame is "
+		  "censored using detections from both before and after it instead "
+		  "of a guess at where things have moved. Covers then sit exactly "
+		  "on what they hide, including through fast motion and for eye "
+		  "bars. The price is that the picture lags by this much (audio "
+		  "does not, and the mouse pointer probably does not either, so it "
+		  "will be ahead of what it points at), which suits watching video "
+		  "rather than playing games. 0 = off (live, no delay). Needs to "
+		  "be longer than one detection pass; if it is not, the picture "
+		  "holds still until the detector catches up, which the run "
+		  "summary counts.", 0, 1000, 10, 0 },
 		{ "smoothing",  "Steadiness of cover edges",
 		  "How quickly a cover shrinks back when the area it is covering "
 		  "gets smaller. Lower is steadier and less jittery, but covers "
@@ -1919,6 +1931,13 @@ int main(int argc, char **argv)
 		}
 
 		auto showCost = [cost] {
+			if (truthy(value("section_split"))) {
+				const bool full = truthy(value("section_full_frame"));
+				cost->setText(QString("Split mode: usually 2 inferences per frame on a "
+				                      "widescreen%1.")
+				              .arg(full ? ", plus one for the whole screen" : ""));
+				return;
+			}
 			const int cols = qMax(1, value("section_cols").toInt());
 			const int rows = qMax(1, value("section_rows").toInt());
 			const bool full = truthy(value("section_full_frame")) &&
@@ -1950,6 +1969,31 @@ int main(int argc, char **argv)
 				showCost();
 			};
 		};
+
+		if (has("section_split")) {
+			auto *cb = new Toggle;
+			cb->setChecked(truthy(value("section_split")));
+			QObject::connect(cb, &QCheckBox::toggled,
+			                 [touch, showCost](bool on) {
+				setValue("section_split", on ? "true" : "false");
+				showCost();
+				touch();
+			});
+			addRow(c, "Split to fit the screen (recommended)",
+			       "Chooses the tiles from the screen's shape instead of the "
+			       "numbers below: on a widescreen, two full-height square tiles "
+			       "that together cover the width, with the overlap worked out so "
+			       "nothing is wasted. That is about the detail of a 4x4 grid for "
+			       "a fraction of the cost, which leaves the detector fast enough "
+			       "to keep up with motion. Turn it off to use the grid below by "
+			       "hand. Changing it rebuilds the detector, so the screen "
+			       "blanks for a moment.", cb);
+			refreshers << [cb, showCost] {
+				QSignalBlocker b(cb);
+				cb->setChecked(truthy(value("section_split")));
+				showCost();
+			};
+		}
 
 		/* BC_MAX_GRID in preprocess.h is 4; offering more here would be
 		 * silently clamped by the core. */

@@ -199,6 +199,14 @@ void *bc_overlay_egl_display(const struct bc_overlay *o);
 void bc_overlay_set_source(struct bc_overlay *o, unsigned tex, int w, int h);
 
 /*
+ * Present the source frame (see bc_overlay_set_source) as an opaque full-screen
+ * background beneath the boxes. This is the delayed screen: the surface stops
+ * being a transparent layer over the live desktop and becomes the picture
+ * itself, so it must only be on while a delayed frame is actually being shown.
+ */
+void bc_overlay_set_background(struct bc_overlay *o, int on);
+
+/*
  * The subject silhouette that `use_mask` boxes are clipped to.
  *
  * `px` is one byte per pixel, w*h, in the segmentation model's letterboxed
