@@ -13,12 +13,15 @@
 #include "capture.h"
 #include "gpu.h"
 #include "overlay.h"
+#include "framering.h"
+#include "delay.h"
 #include "preprocess.h"
 #include "detect.h"
 #include "failsafe.h"
 #include "config.h"
 #include "join.h"
 #include "seam.h"
+#include "eyebar.h"
 #include "track.h"
 #include "hold.h"
 #include "landmark.h"
@@ -301,19 +304,15 @@ static float track_iou_thresh(void)
  * BC_EYEBAR_TOP/BC_EYEBAR_BOT put the tight band back for anyone whose content
  * is reliably upright, or photographic enough for BC_POSE_MODEL to do better.
  */
-#define EYEBAR_TOP    0.22f
-#define EYEBAR_BOT    0.78f
-#define EYEBAR_INSET  0.04f   /* trim each side, so the bar sits inside the face */
+#define EYEBAR_TOP    BC_EB_BAND_TOP
+#define EYEBAR_BOT    BC_EB_BAND_BOT
+#define EYEBAR_INSET  BC_EB_INSET   /* trim each side, so the bar sits inside the face */
 /*
  * 5-point face models (WIDERFACE/RetinaFace convention) put the two eyes at
  * keypoints 0 and 1. The bar is sized from the eye separation, which scales
  * with the face and, unlike the face box, is already in the eyes' own frame.
  */
 #define KPT_MIN_CONF  0.50f   /* both eyes must be this confident to be used */
-#define KPT_BAR_WIDE  1.90f   /* bar length, x eye separation: past outer corners */
-#define KPT_BAR_TALL  0.60f   /* bar height, x eye separation */
-#define KPT_SEP_MIN   0.20f   /* eye separation, as a fraction of the face box */
-#define KPT_SEP_MAX   0.90f
 /*
  * Most faces given to the landmark model in one frame, and the mean heatmap
  * peak below which its answer is not trusted. The peak ran 0.80-0.90 on real
@@ -322,16 +321,15 @@ static float track_iou_thresh(void)
  * answer is worse than the band.
  */
 #define BC_LM_MAX_FACES 8
-#define BC_LM_MIN_SCORE 0.35f
+#define BC_LM_MIN_SCORE BC_EB_LM_MIN_SCORE
 /* Face box padded by this before cropping, matching the package's
  * BBOX_PADDING: the model was trained on crops with this much context. */
-#define BC_LM_PAD     1.25f
+#define BC_LM_PAD     BC_EB_LM_PAD
 /* Grow the measured eye extents by this much, so the bar covers lids and
  * lashes rather than stopping at the outermost landmark. */
-#define LM_BAR_PAD    1.45f
+#define LM_BAR_PAD    BC_EB_LM_BAR_PAD
 
 #define POSE_MIN_IOU  0.30f   /* pose face must overlap the primary face box this much */
-#define KPT_IN_FACE   0.15f   /* how far outside its face an eye may still sit */
 #define AXIS_NEAR     0.35f   /* torso closer than this * face height: degenerate */
 #define AXIS_FAR      8.0f    /* ...further than this * face height: someone else */   /* extrapolation horizon; beyond this, coast */
 #define VEL_MAX_PXMS  6.0f    /* 6000 px/s -- faster than anything real here */
@@ -641,11 +639,70 @@ static const char *SIMILAR_PAIRS[][2] = {
  * buffer. Keeping the two calls together in one place is the cheapest way to
  * make that impossible to get wrong.
  */
+/*
+ * The tiles for "split" mode, from the screen's shape and the network input.
+ *
+ * Fit the screen's height to the network and see how many network-widths the
+ * width comes to: `X`. On a 16:9 screen into a square input that is 1.78, so
+ * two tiles, each the full height of the screen and square in screen pixels,
+ * sharing the 0.22 of a tile they overlap by -- exactly enough that the scale is
+ * the same on both axes and nothing is letterboxed. A taller screen splits down
+ * instead; one that is nearly square needs no split at all.
+ *
+ * Why not just ask for a 2x1 grid: the overlap that makes the scales agree
+ * depends on the screen, and a fixed one either wastes pixels (too much
+ * overlap shrinks everything) or leaves a gap (too little). It is also why this
+ * wants a square input: into 640x384 the same two tiles would be letterboxed to
+ * a 384 square, which is the waste this exists to remove.
+ */
+static void split_geometry(int w, int h, int nw, int nh,
+                           int *cols, int *rows, float *overlap)
+{
+	*cols = *rows = 1;
+	*overlap = 0.0f;
+	if (w <= 0 || h <= 0 || nw <= 0 || nh <= 0)
+		return;
+	const double x = (double)nh * w / ((double)nw * h);   /* net-widths across */
+	const double y = (double)nw * h / ((double)nh * w);   /* net-heights down  */
+	const int across = x >= y;
+	const double axis = across ? x : y;
+	if (axis < 1.3)
+		return;                                   /* not worth a second pass */
+	int tiles = (int)ceil(axis);
+	if (tiles > BC_MAX_GRID)
+		tiles = BC_MAX_GRID;
+	*(across ? cols : rows) = tiles;
+	double ov = ((double)tiles - axis) / (double)(tiles - 1);
+	if (ov < 0.0) ov = 0.0;
+	if (ov > 0.9) ov = 0.9;
+	*overlap = (float)ov;
+}
+
+/*
+ * The network input to ask a 640-trained model for. A dynamic model takes any
+ * size, and the shape should follow what it will be fed: split tiles are
+ * square, so a square input wastes none of them; one tile of the whole screen
+ * is wide, so the short input saves the rows a letterbox would leave black.
+ * Models not named 640 are left at whatever they were.
+ */
+static void want_net(const char *model, int split, int *w, int *h)
+{
+	if (strstr(model, "640")) {
+		*w = 640;
+		*h = split ? 640 : 384;
+	}
+}
+
 static void apply_sections(struct bc_preproc *p, struct bc_detector *d,
-                           const struct bc_config *c)
+                           const struct bc_config *c, int screen_w, int screen_h)
 {
 	if (!p)
 		return;
+	int cols = c->section_cols, rows = c->section_rows;
+	float overlap = c->section_overlap;
+	if (c->section_split)
+		split_geometry(screen_w, screen_h, bc_preproc_net_w(p),
+		               bc_preproc_net_h(p), &cols, &rows, &overlap);
 
 	/*
 	 * Both calls below reallocate a buffer an inference may be reading:
@@ -662,8 +719,7 @@ static void apply_sections(struct bc_preproc *p, struct bc_detector *d,
 	if (d)
 		bc_detect_wait_idle(d);
 
-	bc_preproc_set_grid(p, c->section_cols, c->section_rows,
-	                    c->section_overlap, c->section_full_frame);
+	bc_preproc_set_grid(p, cols, rows, overlap, c->section_full_frame);
 	if (d)
 		bc_detect_set_tiles(d, bc_preproc_tiles(p));
 
@@ -924,9 +980,7 @@ static int classes_similar(int a, int b)
  */
 static float wrap_bar(float a)
 {
-	while (a >   1.57079633f) a -= 3.14159265f;
-	while (a <= -1.57079633f) a += 3.14159265f;
-	return a;
+	return bc_eyebar_wrap(a);
 }
 
 /*
@@ -960,16 +1014,7 @@ static int torso_rank(const char *n)
  */
 static int is_head_class(const char *n)
 {
-	static const char *heads[] = {
-		"HEAD", "HDRAGO", "HPONY", "HFOX", "HRABB",
-		"HCAT", "HBEAR", "HHORSE", "HBIRD",
-	};
-	if (strstr(n, "FACE"))
-		return 1;
-	for (unsigned i = 0; i < sizeof heads / sizeof heads[0]; i++)
-		if (!strcmp(n, heads[i]))
-			return 1;
-	return 0;
+	return bc_is_head_class(n);
 }
 
 /*
@@ -1485,6 +1530,7 @@ struct bc_live {
 	double secs;
 	int net_w;
 	int net_h;
+	int net_req_h;                         /* the height last asked of the model, which a fixed one ignores */
 	struct bc_overlay *ov;
 	struct bc_gpu *gpu;
 	struct bc_capture *cap;
@@ -1596,6 +1642,34 @@ struct bc_live {
 	struct track meta[BC_TRK_MAX];
 	struct bc_box boxes[BC_MAX_BOXES];
 	struct bc_det dets[BC_MAX_DET];
+	/*
+	 * Screen delay (cfg.delay_ms, DESIGN: delayed screen). The capture is kept
+	 * in a GPU ring and shown `delay` late, so each frame can be covered from
+	 * detections on both sides of it; `dh` is the record of what the censor
+	 * had decided to cover each time it looked. `show` is the failsafe's
+	 * verdict for this frame: only an ordinary censoring frame is delayed.
+	 */
+	struct bc_framering *ring;
+	struct bc_dh *dh;
+	float  delay_applied;                  /* ms the ring is sized for; 0 = off */
+	double ring_interval;                  /* ms between frames kept */
+	double ring_last_push;
+	unsigned long ring_seq;
+	double submit_t;                       /* capture time of the frame in flight */
+	int    snap_pending;
+	double snap_t;
+	int    shown_valid;
+	unsigned long shown_seq;
+	struct bc_box shown_boxes[BC_MAX_BOXES];
+	int    shown_n;
+	enum bc_fs_show show;
+	unsigned long delay_shown, delay_held, delay_blank;
+	double play_t, play_last, last_stall;  /* the display clock; see delay_prepare() */
+	int    play_have;
+	unsigned long delay_stalled, delay_distinct;
+	unsigned long doubled_bar_frames;      /* frames with two eye bars on one spot */
+	unsigned long delay_doubled;           /* the same, of the delayed frames shown */
+	struct stat s_delay_lag, s_delay_gap;
 	struct stat s_pre;
 	struct stat s_present;
 	struct stat s_infer;
@@ -1872,7 +1946,15 @@ static void step_config(struct bc_live *lv)
 			 * would be a guess about content we are not
 			 * looking at.
 			 */
-			if (lv->cfg.model[0] && strcmp(lv->cfg.model, lv->cur_model)) {
+			/* A change of tiling can change the shape the network wants
+			 * (split tiles are square), which is rebuilt exactly as a
+			 * model swap is: the input size is fixed when the session
+			 * is made. */
+			int net_wanted_w = lv->net_w, net_wanted_h = lv->net_req_h;
+			want_net(lv->cfg.model, lv->cfg.section_split,
+			         &net_wanted_w, &net_wanted_h);
+			if (lv->cfg.model[0] && (strcmp(lv->cfg.model, lv->cur_model) ||
+			                         net_wanted_h != lv->net_req_h)) {
 				LOG("model: swapping to %s", lv->cfg.model);
 				int nb = 0;
 				/* Reverse would read the single
@@ -1893,10 +1975,9 @@ static void step_config(struct bc_live *lv)
 				 * the new one at 320x192.
 				 */
 				int req_w = lv->net_w, req_h = lv->net_h;
-				if (strstr(lv->cfg.model, "640")) {
-					req_w = 640;
-					req_h = 384;
-				}
+				want_net(lv->cfg.model, lv->cfg.section_split,
+				         &req_w, &req_h);
+				lv->net_req_h = req_h;
 				struct bc_detector *nd =
 					bc_detect_create(lv->cfg.model, req_w,
 					                 req_h, 4);
@@ -1917,7 +1998,8 @@ static void step_config(struct bc_live *lv)
 
 					bc_preproc_destroy(lv->pp);
 					lv->pp = bc_preproc_create(lv->net_w, lv->net_h);
-					apply_sections(lv->pp, lv->det, &lv->cfg);
+					apply_sections(lv->pp, lv->det, &lv->cfg, bc_overlay_width(lv->ov),
+					               bc_overlay_height(lv->ov));
 					free(lv->tensor);
 					lv->tensor = lv->pp ? malloc(bc_preproc_total_floats(lv->pp)
 					                     * sizeof *lv->tensor) : NULL;
@@ -1997,7 +2079,8 @@ static void step_config(struct bc_live *lv)
 			 */
 			{
 				const size_t was = bc_preproc_total_floats(lv->pp);
-				apply_sections(lv->pp, lv->det, &lv->cfg);
+				apply_sections(lv->pp, lv->det, &lv->cfg, bc_overlay_width(lv->ov),
+					               bc_overlay_height(lv->ov));
 				const size_t now = bc_preproc_total_floats(lv->pp);
 				if (now != was) {
 					float *nt = malloc(now * sizeof *nt);
@@ -2659,8 +2742,194 @@ static void step_outlines(struct bc_live *lv)
 }
 
 /* Capture. Non-blocking; imports the newest frame if any. */
+
+/*
+ * Screen delay: the ring and the record of boxes are sized from the config,
+ * and rebuilt when it changes. A delay of 0 is the live overlay and costs
+ * nothing -- no ring, no record, no opaque background.
+ *
+ * The ring holds the delay plus 400 ms, so a slow detection pass lengthens the
+ * lag (the screen waits for the frame it can vouch for) rather than stalling
+ * it. It keeps a frame every `ring_interval` ms, not every captured frame: at
+ * 140 captured frames a second the full history would be a gigabyte of VRAM,
+ * and the picture only needs to be as smooth as the video in it.
+ */
+static void delay_apply(struct bc_live *lv)
+{
+	float want = lv->cfg.delay_ms;
+	const char *e = getenv("BC_DELAY_MS");
+	if (e)
+		want = (float)atof(e);
+	if (!(want >= 0.0f))
+		want = 0.0f;
+	if (want > 1000.0f)
+		want = 1000.0f;
+	if (want == lv->delay_applied)
+		return;
+
+	if (lv->ring) { bc_framering_destroy(lv->ring); lv->ring = NULL; }
+	if (lv->dh)   { bc_dh_destroy(lv->dh); lv->dh = NULL; }
+	lv->delay_applied = want;
+	lv->shown_valid = 0;
+	lv->play_have = 0;
+	lv->snap_pending = 0;
+	bc_overlay_set_background(lv->ov, 0);
+	if (want <= 0.0f) {
+		LOG("screen delay: off");
+		return;
+	}
+	const double window = (double)want + 400.0;
+	lv->ring_interval = window / 50.0 > 16.0 ? window / 50.0 : 16.0;
+	const int slots = (int)ceil(window / lv->ring_interval) + 3;
+	lv->ring = bc_framering_create(bc_overlay_width(lv->ov),
+	                               bc_overlay_height(lv->ov), slots);
+	lv->dh = bc_dh_create(512);
+	if (!lv->ring || !lv->dh) {
+		ERR("screen delay unavailable (no frame ring) -- staying live");
+		if (lv->ring) { bc_framering_destroy(lv->ring); lv->ring = NULL; }
+		if (lv->dh)   { bc_dh_destroy(lv->dh); lv->dh = NULL; }
+		return;
+	}
+	LOG("screen delay: %.0f ms, one frame kept every %.0f ms", want,
+	    lv->ring_interval);
+}
+
+/* Keep a copy of the frame just captured, before the compositor reuses it. */
+static void delay_push_frame(struct bc_live *lv)
+{
+	const unsigned tex = bc_gpu_texture(lv->gpu);
+	if (!lv->ring || !tex)
+		return;
+	if (lv->last_frame - lv->ring_last_push < lv->ring_interval - 1.0)
+		return;
+	if (bc_framering_push(lv->ring, tex, ++lv->ring_seq, lv->last_frame) == 0) {
+		lv->ring_last_push = lv->last_frame;
+		/* The copy must keep the colours: debug only, it reads pixels back. */
+		if (getenv("BC_RING_CHECK") && lv->ring_seq == 20)
+			bc_framering_selftest(lv->ring, tex);
+	}
+}
+
+/*
+ * The last step before presenting: with the delay on, replace "the covers for
+ * now over the screen of now" with "the covers for then over the screen of
+ * then".
+ *
+ * `then` is the delay ago, but never later than the newest thing the censor
+ * has looked at -- a frame nothing at or after it has been checked against is
+ * not shown, so a slow detector makes the screen lag further instead of
+ * letting an unchecked frame through. If even the oldest frame the ring holds
+ * is not vouched for, the last frame shown is held; and if there is none,
+ * black. Never an unchecked frame (§6).
+ *
+ * Only an ordinary censoring frame is delayed. Panic, pause, the master
+ * switch, the fail-closed blank and hand-drawing all mean "act on what is
+ * real now", and show the live screen or the blank exactly as before.
+ */
+static int has_doubled_bar(const struct bc_box *bx, int n);
+
+static void delay_prepare(struct bc_live *lv)
+{
+	if (!lv->ring || !lv->dh)
+		return;
+	if (lv->show != BC_SHOW_CENSOR || lv->cfg.draw) {
+		bc_dh_reset(lv->dh);
+		lv->snap_pending = 0;
+		lv->shown_valid = 0;
+		lv->play_have = 0;
+		bc_overlay_set_background(lv->ov, 0);
+		return;
+	}
+	if (lv->snap_pending) {
+		bc_dh_push(lv->dh, lv->snap_t, lv->boxes, lv->n_boxes);
+		lv->snap_pending = 0;
+	}
+
+	/*
+	 * The display clock. It runs at real speed and is held back only by what
+	 * has been checked: it may not pass the newest record. Capping a target
+	 * of `now - delay` at the newest record instead makes the picture advance
+	 * in jumps the size of the detection interval -- 3 frames a second for a
+	 * heavy model on a tile grid -- because the newest record moves in jumps.
+	 * Here a stall costs the delay a little more lag and then plays on at full
+	 * speed, so the lag grows to the smallest value that does not stall and
+	 * stays there; it drifts back toward the delay asked for, slowly, only
+	 * when nothing has stalled for a while.
+	 */
+	const double want = (double)lv->delay_applied;
+	const double newest = bc_dh_newest(lv->dh);
+	if (!lv->play_have) {
+		lv->play_t = lv->t - want;
+		lv->play_have = 1;
+	} else {
+		/* 12% fast closes a second of excess lag in under ten, and only
+		 * once the clock has been free of the horizon for a while. */
+		const double rate = (lv->t - lv->last_stall > 1500.0 &&
+		                     lv->t - lv->play_t > want + 30.0) ? 1.12 : 1.0;
+		lv->play_t += (lv->t - lv->play_last) * rate;
+	}
+	lv->play_last = lv->t;
+	if (lv->play_t > lv->t - want)
+		lv->play_t = lv->t - want;                  /* never less lag than asked */
+	if (lv->play_t < lv->t - (want + 350.0))
+		lv->play_t = lv->t - (want + 350.0);        /* the ring's reach */
+	if (lv->play_t > newest) {
+		lv->play_t = newest;                        /* nothing has checked past here */
+		lv->last_stall = lv->t;
+		lv->delay_stalled++;
+	}
+	const double t_sel = lv->play_t;
+
+	struct bc_box tmp[BC_MAX_BOXES];
+	unsigned long seq = 0;
+	double tf = 0.0, gap = 0.0;
+	unsigned tex = bc_framering_at(lv->ring, t_sel, &seq, &tf);
+	int n = tex ? bc_dh_boxes(lv->dh, tf, tmp, BC_MAX_BOXES, &gap) : -1;
+
+	if (tex && n >= 0) {
+		memcpy(lv->boxes, tmp, (size_t)n * sizeof tmp[0]);
+		lv->n_boxes = n;
+		memcpy(lv->shown_boxes, tmp, (size_t)n * sizeof tmp[0]);
+		lv->shown_n = n;
+		lv->delay_doubled += (unsigned long)has_doubled_bar(lv->boxes, n);
+		if (!lv->shown_valid || lv->shown_seq != seq)
+			lv->delay_distinct++;
+		lv->shown_seq = seq;
+		lv->shown_valid = 1;
+		lv->delay_shown++;
+		stat_add(&lv->s_delay_lag, lv->t - tf);
+		stat_add(&lv->s_delay_gap, gap);
+	} else if (lv->shown_valid &&
+	           (tex = bc_framering_get(lv->ring, lv->shown_seq)) != 0) {
+		memcpy(lv->boxes, lv->shown_boxes,
+		       (size_t)lv->shown_n * sizeof lv->boxes[0]);
+		lv->n_boxes = lv->shown_n;
+		lv->delay_held++;
+	} else {
+		blank_all(lv->ov, lv->boxes, &lv->n_boxes);
+		lv->delay_blank++;
+		bc_overlay_set_background(lv->ov, 0);
+		return;
+	}
+	bc_overlay_set_source(lv->ov, tex, bc_gpu_width(lv->gpu),
+	                      bc_gpu_height(lv->gpu));
+	bc_overlay_set_background(lv->ov, 1);
+}
+
+/* BC_DEBUG_TENSOR writes the detector's input once; BC_DEBUG_TENSOR_AFTER_MS
+ * holds it back until that long into the run, so it can show what the
+ * detector sees once the overlay is up (the first frame never can). */
+static int dump_due(const struct bc_live *lv)
+{
+	if (!lv->dump_path || lv->dumped)
+		return 0;
+	const char *e = getenv("BC_DEBUG_TENSOR_AFTER_MS");
+	return !e || now_ms() - lv->start >= atof(e);
+}
+
 static void step_capture(struct bc_live *lv)
 {
+	delay_apply(lv);
 	double since_start = now_ms() - lv->start;
 	int faked_stall = lv->fault_stall > 0.0 && since_start > lv->fault_stall;
 	int faked_dead  = lv->fault_dead  > 0.0 && since_start > lv->fault_dead;
@@ -2686,6 +2955,7 @@ static void step_capture(struct bc_live *lv)
 		lv->last_frame = now_ms();
 		bc_overlay_set_source(lv->ov, bc_gpu_texture(lv->gpu),
 		                      bc_gpu_width(lv->gpu), bc_gpu_height(lv->gpu));
+		delay_push_frame(lv);
 	}
 }
 
@@ -2930,6 +3200,7 @@ static enum bc_next step_submit(struct bc_live *lv)
 					 */
 					lv->gate_forced++;
 					if (submit_tensor(lv->pp, lv->det, lv->tensor, lv->want_host, &lv->host_filled)) {
+						lv->submit_t = lv->last_frame;
 						lv->submitted++;
 						lv->force_infer = 0;
 						hold_after_submit(&lv->tracker, lv->pp,
@@ -2969,6 +3240,11 @@ static enum bc_next step_submit(struct bc_live *lv)
 						lv->force_infer = 1;
 					lv->last_infer = tg;
 					lv->gated++;
+					/* Nothing moved since the last frame looked at: that
+					 * frame, and this one, are covered by what is drawn. */
+					lv->snap_pending = 1;
+					if (lv->last_frame > lv->snap_t)
+						lv->snap_t = lv->last_frame;
 				} else if (lv->peek_enabled && !lv->clean_pending &&
 				           now_ms() - lv->last_clean_ms < GATE_BLIND_MS) {
 					/*
@@ -3027,8 +3303,9 @@ static enum bc_next step_submit(struct bc_live *lv)
 					 * is permanently busy */
 					lv->skipped++;
 				} else if (submit_tensor(lv->pp, lv->det, lv->tensor,
-				                         (lv->dump_path && !lv->dumped) || lv->want_host,
+				                         dump_due(lv) || lv->want_host,
 				                         &lv->host_filled)) {
+					lv->submit_t = lv->last_frame;
 					/*
 					 * The only place the tensor can
 					 * cross the bus, and only when it
@@ -3046,7 +3323,7 @@ static enum bc_next step_submit(struct bc_live *lv)
 					    lv->tensor, lv->prev_tensor, &lv->hold_have_prev,
 					    lv->host_filled, now_ms(), &lv->s_mad,
 					    &lv->held_released, &lv->held_capped);
-					if (lv->dump_path && !lv->dumped) {
+					if (dump_due(lv)) {
 						bc_preproc_dump_ppm(lv->pp, lv->tensor,
 						                    lv->dump_path);
 						lv->dumped = 1;
@@ -3127,6 +3404,7 @@ static enum bc_next step_submit(struct bc_live *lv)
 			 * holds the last frame it preprocessed, which is
 			 * by construction what is still on screen. */
 			if (submit_tensor(lv->pp, lv->det, lv->tensor, lv->want_host, &lv->host_filled)) {
+						lv->submit_t = lv->last_frame;
 				hold_after_submit(&lv->tracker, lv->pp, lv->tensor,
 				    lv->prev_tensor, &lv->hold_have_prev, lv->host_filled,
 				    now_ms(), &lv->s_mad, &lv->held_released,
@@ -3290,6 +3568,12 @@ static void step_detections(struct bc_live *lv)
 	 * or the run failed; the failure is acted on below. */
 	int n = res.status == BC_DET_OK ? res.n : -1;
 	lv->tnow = now_ms();
+	if (n >= 0) {
+		/* A look at the frame that was submitted, which is not this one. */
+		lv->snap_pending = 1;
+		if (lv->submit_t > lv->snap_t)
+			lv->snap_t = lv->submit_t;
+	}
 	if (n > 0) {
 		/*
 		 * Into screen space, here and once.
@@ -3329,7 +3613,7 @@ static void step_detections(struct bc_live *lv)
 			float ox, oy;
 			bc_preproc_overlap_px(lv->pp, &ox, &oy);
 			const int before = n;
-			n = bc_seam_merge(lv->dets, n, lv->cfg.section_cols,
+			n = bc_seam_merge(lv->dets, n, bc_preproc_cols(lv->pp),
 			                  bc_preproc_full_tile(lv->pp),
 			                  ox, oy, SEAM_THRESH,
 			                  classes_similar);
@@ -3671,8 +3955,6 @@ static void step_detections(struct bc_live *lv)
 					float ey0 = kp_y0;
 					float ex1 = kp_x1;
 					float ey1 = kp_y1;
-					float dx = ex1 - ex0, dy = ey1 - ey0;
-					float sep = sqrtf(dx * dx + dy * dy);
 					/*
 					 * Confidence is the model's opinion of
 					 * its own output and cannot catch it
@@ -3680,56 +3962,32 @@ static void step_detections(struct bc_live *lv)
 					 * what a WIDERFACE model does on anime,
 					 * where it finds the box but regresses
 					 * the landmarks somewhere else on the
-					 * face. Check the geometry instead:
+					 * face. The geometry is checked instead:
 					 * eyes belong inside their own face box,
 					 * separated by a sane fraction of it.
-					 * Failing this falls through to the
+					 * Failing that falls through to the
 					 * body axis, which is the behaviour
 					 * that was claimed for the confidence
 					 * gate and never actually happened.
+					 *
+					 * The rules live in eyebar.c, shared
+					 * with the offline passes: one copy of
+					 * "which answers are believable".
 					 */
-					float span = fw > fh ? fw : fh;
-					float mx = fw * KPT_IN_FACE, my = fh * KPT_IN_FACE;
-					int sane = sep >= span * KPT_SEP_MIN &&
-					           sep <= span * KPT_SEP_MAX &&
-					           ex0 >= fx - mx && ex0 <= fx + fw + mx &&
-					           ex1 >= fx - mx && ex1 <= fx + fw + mx &&
-					           ey0 >= fy - my && ey0 <= fy + fh + my &&
-					           ey1 >= fy - my && ey1 <= fy + fh + my;
-					if (!sane)
+					struct bc_eyebar eb;
+					const int er = bc_eyebar_from_eyes(
+					    ex0, ey0, ex1, ey1, lm_along, lm_across,
+					    lv->lm_bar_pad, lv->lm_nofloor,
+					    fx, fy, fw, fh, &eb);
+					if (er < 0)
 						lv->kpt_reject++;
-					if (sane && sep > 1.0f) {
-						/* screen y grows down, GL's up */
-						angle = wrap_bar(atan2f(-dy, dx));
-						/* Measured extents when we have
-						 * them, padded so the bar covers
-						 * the lids and lashes too, not
-						 * just the points themselves. */
-						float barw, barh;
-						if (lm_along > 0.0f && lm_across > 0.0f) {
-							barw = 2.0f * lm_along  * lv->lm_bar_pad;
-							barh = 2.0f * lm_across * lv->lm_bar_pad;
-						} else {
-							barw = sep * KPT_BAR_WIDE;
-							barh = sep * KPT_BAR_TALL;
-						}
-						/* Never thinner than the
-						 * separation-scaled bar would have
-						 * been: §2 prefers covering too
-						 * much, and a model that clustered
-						 * its points tightly must not
-						 * shrink the cover below what the
-						 * old heuristic gave. */
-						if (!lv->lm_nofloor) {
-							if (barw < sep * KPT_BAR_WIDE)
-								barw = sep * KPT_BAR_WIDE;
-							if (barh < sep * KPT_BAR_TALL)
-								barh = sep * KPT_BAR_TALL;
-						}
-						x0 = (ex0 + ex1) * 0.5f - barw * 0.5f;
-						y0 = (ey0 + ey1) * 0.5f - barh * 0.5f;
-						w  = barw;
-						h  = barh;
+					if (er > 0) {
+						const float sep = hypotf(ex1 - ex0, ey1 - ey0);
+						angle = eb.angle;
+						x0 = eb.cx - eb.w * 0.5f;
+						y0 = eb.cy - eb.h * 0.5f;
+						w  = eb.w;
+						h  = eb.h;
 						kpt_bar = 1;
 						lv->eyebar_kpt++;
 						if (lv->debug_lm)
@@ -4897,6 +5155,31 @@ static void step_regions(struct bc_live *lv)
 }
 
 /* Decide what may be shown, then takeover and joining. */
+/* Do two eye bars overlap each other? */
+static int has_doubled_bar(const struct bc_box *bx, int n)
+{
+	for (int i = 0; i < n; i++) {
+		if (!bx[i].over)
+			continue;
+		for (int j = i + 1; j < n; j++) {
+			if (!bx[j].over)
+				continue;
+			const struct bc_box *a = &bx[i], *b = &bx[j];
+			const int x1 = a->x > b->x ? a->x : b->x;
+			const int y1 = a->y > b->y ? a->y : b->y;
+			const int x2 = a->x + a->w < b->x + b->w ? a->x + a->w : b->x + b->w;
+			const int y2 = a->y + a->h < b->y + b->h ? a->y + a->h : b->y + b->h;
+			if (x2 <= x1 || y2 <= y1)
+				continue;
+			const double inter = (double)(x2 - x1) * (y2 - y1);
+			const double uni = (double)a->w * a->h + (double)b->w * b->h - inter;
+			if (uni > 0.0 && inter / uni > 0.2)
+				return 1;
+		}
+	}
+	return 0;
+}
+
 static void step_decide(struct bc_live *lv)
 {
 	/* §6 and the user's switches, ranked -- see failsafe.h. */
@@ -4909,6 +5192,7 @@ static void step_decide(struct bc_live *lv)
 			.enabled = lv->cfg.enabled, .reverse = lv->cfg.reverse,
 		});
 	bc_overlay_set_reverse(lv->ov, verdict.reverse);
+	lv->show = verdict.show;
 
 	switch (verdict.show) {
 	case BC_SHOW_PANIC:
@@ -5001,6 +5285,13 @@ static void step_decide(struct bc_live *lv)
 		lv->joins_made += (unsigned long)(before - lv->n_boxes);
 	}
 
+	/*
+	 * Two eye bars overlapping each other is one face with two covers on it:
+	 * a track that was never taken over. Counted per frame, so a doubled bar
+	 * is a number and not an impression from a recording.
+	 */
+	lv->doubled_bar_frames += (unsigned long)has_doubled_bar(lv->boxes, lv->n_boxes);
+
 	if (lv->n_boxes > 0)
 		lv->frames_with_boxes++;
 	if ((lv->n_boxes > 0) != lv->prev_had_boxes) {
@@ -5084,6 +5375,7 @@ static void step_mask(struct bc_live *lv)
 static enum bc_next step_present(struct bc_live *lv)
 {
 	lv->t = now_ms();
+	delay_prepare(lv);
 	/*
 	 * Is any cover overdue for verification? A track the detector
 	 * has not measured for GATE_HOLD_MS is one we have been
@@ -5268,7 +5560,8 @@ int main(int argc, char **argv)
 	 * decides, and announcing the fallback here named a model that was
 	 * never loaded.
 	 */
-	if (strstr(model, "640")) { lv->net_w = 640; lv->net_h = 384; }
+	want_net(model, lv->cfg.section_split, &lv->net_w, &lv->net_h);
+	lv->net_req_h = lv->net_h;
 	LOG("output=%s model=%s net=%dx%d duration=%.1fs",
 	    output ? output : "auto (first listed)", model, lv->net_w, lv->net_h, lv->secs);
 	cfg_env_overrides(&lv->cfg);
@@ -5364,7 +5657,8 @@ int main(int argc, char **argv)
 	lv->pp = bc_preproc_create(lv->net_w, lv->net_h);
 	if (!lv->pp)
 		goto out;
-	apply_sections(lv->pp, lv->det, &lv->cfg);
+	apply_sections(lv->pp, lv->det, &lv->cfg, bc_overlay_width(lv->ov),
+					               bc_overlay_height(lv->ov));
 
 	/*
 	 * Second detector, for eye position only.
@@ -5905,6 +6199,15 @@ int main(int argc, char **argv)
 	    lv->gate_forced, lv->gate_forced / elapsed);
 	LOG("  inferences completed    : %lu (%.1f/s)",
 	    bc_detect_count(lv->det), bc_detect_count(lv->det) / elapsed);
+	if (lv->delay_applied > 0.0f && lv->ring)
+		LOG("  screen delay            : %.0f ms asked; shown %.0f ms behind on average (max %.0f), "
+		    "records bracketed %.0f ms apart; %lu frames held, %lu blanked, of %lu; "
+		    "%.1f distinct frames/s shown, clock held at the checked horizon %lu times; "
+		    "%lu shown frames with two eye bars on one spot",
+		    lv->delay_applied, stat_mean(&lv->s_delay_lag), lv->s_delay_lag.max,
+		    stat_mean(&lv->s_delay_gap), lv->delay_held, lv->delay_blank,
+		    lv->delay_shown + lv->delay_held + lv->delay_blank,
+		    lv->delay_distinct / elapsed, lv->delay_stalled, lv->delay_doubled);
 	LOG("  present rate            : %.1f fps over %.2fs",
 	    lv->presents / elapsed, elapsed);
 	LOG("  frames showing a box    : %lu / %lu (%.1f%%)",
@@ -5936,6 +6239,10 @@ int main(int argc, char **argv)
 	if (lv->peeks_granted / elapsed > 1000.0 / BC_PEEK_MIN_MS + 0.01)
 		WARN("  peek rate exceeded its limit -- this is a flash-safety "
 		     "bug, not a tuning problem");
+	LOG("  tracks                  : %lu taken over by a nearby detection; "
+	    "%lu frames (%.1f%%) with two eye bars on one spot",
+	    lv->tracker.revived, lv->doubled_bar_frames,
+	    lv->presents ? 100.0 * lv->doubled_bar_frames / lv->presents : 0.0);
 	LOG("  track churn             : %lu created, %lu expired (%.1f/s) "
 	    "<- perceived flicker", lv->tracker.created, lv->tracker.removed,
 	    lv->tracker.removed / elapsed);
@@ -6069,6 +6376,8 @@ out:
 	free(lv->lasso_dil);
 	free(lv->lasso_band);
 	free(lv->lasso_base);
+	if (lv->ring) bc_framering_destroy(lv->ring);
+	if (lv->dh)   bc_dh_destroy(lv->dh);
 	if (lv->pp)  bc_preproc_destroy(lv->pp);
 	if (lv->gpu) bc_gpu_destroy(lv->gpu);
 	if (have_portal) bc_portal_release(&portal);

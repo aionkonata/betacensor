@@ -29,6 +29,7 @@ struct bc_off_gl {
 	unsigned   prog, blit, vao, harden;
 	unsigned   fbo, fbo_tex, src_tex, font_tex, work_tex;
 	int        h_block, h_seed, h_amp, h_glyph, h_mark;
+	int        h_box, h_angle, h_turned;
 	int        u_size, u_block, u_alpha, u_effect, u_time, u_box;
 	int        u_feather, u_angle, u_color, u_text, u_text_len;
 	int        u_text_mode, u_text_col;
@@ -77,6 +78,10 @@ void bc_off_draw(struct bc_off_gl *g, const struct bc_box *b, int n, double t);
  */
 void bc_off_harden(struct bc_off_gl *g, const struct bc_box *b, int n,
                    uint32_t seed);
+
+/* Is pixel (x, y), top-down, inside box `b` -- turned by its angle if it has
+ * one? The same test the shader makes, for code that has to agree with it. */
+int  bc_off_box_has(const struct bc_box *b, int x, int y);
 
 /* Does this overlay effect sample the content under it? */
 int  bc_off_effect_samples(int effect);
@@ -138,6 +143,82 @@ int  bc_off_effect(int cfg_effect);
  */
 struct bc_box bc_off_box(const struct bc_config *cfg, int cls,
                          int x, int y, int w, int h);
+
+/* The same with the effect named, for a cover whose effect is not its class's
+ * -- the eye bar's own. `ce` is a config effect index (BC_CFG_*). */
+struct bc_box bc_off_box_fx(const struct bc_config *cfg, int ce, int cls,
+                            int x, int y, int w, int h);
+
+/*
+ * Transparency survives where the format can hold it. `render` is the censored
+ * frame, `flat` the source composited over white (what was detected), `rgba`
+ * the source as decoded. Every pixel an effect touched -- inside a box, or
+ * changed at all, which also catches tape's full-width bars and static's
+ * feathered edge -- is taken from the render and made opaque, so no original
+ * colour hides under a transparent cover. Everything else is the source pixel
+ * exactly. Writes w*h*4 bytes to `out`.
+ */
+void bc_off_compose_alpha(const unsigned char *render, const unsigned char *flat,
+                          const unsigned char *rgba, int w, int h,
+                          const struct bc_box *boxes, int nb,
+                          unsigned char *out);
+
+/* ---- the eye bar ---------------------------------------------------------
+ *
+ * Shared by the image and video passes, on the geometry in eyebar.h that the
+ * live censor uses too. A face gets a bar from the landmark model where it
+ * gave a believable answer and from the band otherwise -- the band covers more
+ * than the eyes, which is the fail-closed direction, so a model that is
+ * missing or wrong costs tightness and never coverage.
+ */
+#include "eyebar.h"
+
+struct bc_landmark;
+
+struct bc_off_face { float x, y, w, h; };
+
+enum { BC_OFF_EB_EYES = 1, BC_OFF_EB_BAND = 2 };
+
+struct bc_off_eb {
+	struct bc_landmark *lm;
+	struct bc_preproc  *lpp;
+	float              *lt;
+	char                lm_path[512];   /* last tried, loaded or not */
+	int                 lm_warned;
+	/* What it did, for the run summary. */
+	unsigned long       bars, bands, weak, rejected, eyes_dropped;
+};
+
+/*
+ * A bar for each of `n` faces (image pixels), computed from the frame
+ * currently uploaded to `g` -- the crops are cut from that texture. kind[i]
+ * is BC_OFF_EB_EYES or BC_OFF_EB_BAND. The landmark model comes from the
+ * config's landmark_model, or BC_LANDMARK_MODEL, and is loaded on first use
+ * and reloaded if the name changes.
+ */
+void bc_off_eb_bars(struct bc_off_eb *eb, const struct bc_config *cfg,
+                    struct bc_off_gl *g, const struct bc_off_face *f, int n,
+                    struct bc_eyebar *bars, int *kind);
+void bc_off_eb_free(struct bc_off_eb *eb);
+
+/*
+ * The cover for one bar, or 0 if it lies wholly off the image. `face` is the
+ * face it belongs to; `grow` is the dilation factor still to apply. With the
+ * face covered too (cfg->eye_bar_face) the bar scales about the face's centre,
+ * as the live censor's fractions-of-the-face layout makes it; alone, about its
+ * own. The bar's effect is eye_bar_effect when set, else its class's.
+ */
+int  bc_off_eb_box(const struct bc_config *cfg, int cls,
+                   const struct bc_off_face *face, const struct bc_eyebar *bar,
+                   float grow, int iw, int ih, struct bc_box *out);
+
+/*
+ * With the eye bar on, an EYE detection inside a head is the bar's business,
+ * not a cover of its own: drawn as one it puts a window with the class's
+ * effect over the eye. Compacts them out of d[] and returns the new count.
+ */
+int  bc_off_drop_eyes(const struct bc_config *cfg, struct bc_det *d, int n,
+                      unsigned long *dropped);
 
 /* The live path's class pairing: the BREAST variants are one physical thing. */
 int  bc_off_classes_similar(int a, int b);

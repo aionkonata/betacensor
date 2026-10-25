@@ -336,6 +336,68 @@ static void test_holding_does_not_forge_a_measurement(const int *censor)
 	check(held == 1, "  and does not cancel the fresh one's hold");
 }
 
+/*
+ * A face that moves further between two looks than its own box overlaps is
+ * not a new face. Matching by overlap alone opened a second track for it and
+ * left the first predicted in place, so both were drawn -- two covers, and
+ * two eye bars, on one face.
+ */
+static void test_revival(const int *censor)
+{
+	struct bc_tracker tr;
+	bc_tracker_init(&tr, 0.35f, 0.30f, 500.0);
+	tr.revive = 1;
+
+	int dt[2];
+	struct bc_det a = det(500, 400, 200, 200, 0.80f);
+	bc_tracker_update(&tr, &a, 1, 0.0, censor, dt);
+	const int id = dt[0];
+	const double born = tr.t[id].born;
+
+	/* Moved 190 px right: a 200 px box with no overlap left (IoU 0.05). */
+	struct bc_det b = det(690, 400, 200, 200, 0.80f);
+	bc_tracker_update(&tr, &b, 1, 66.0, censor, dt);
+	check(live_tracks(&tr) == 1, "a jump past the overlap is still one track");
+	check(dt[0] == id && tr.t[id].born == born, "...the same one, identity intact");
+	check(tr.created == 1 && tr.revived == 1, "...taken over, not created");
+	float x, y, w, h;
+	bc_trk_box(&tr.t[id], &x, &y, &w, &h);
+	check(fabsf(x - 690.0f) < 5.0f, "...and it sits where the detection put it");
+
+	/* Far away is something else. */
+	struct bc_det c = det(1600, 400, 200, 200, 0.80f);
+	bc_tracker_update(&tr, &c, 1, 132.0, censor, dt);
+	check(tr.created == 2, "a detection a long way off opens its own track");
+
+	/* A very different size is something else too. */
+	struct bc_tracker t2;
+	bc_tracker_init(&t2, 0.35f, 0.30f, 500.0);
+	t2.revive = 1;
+	struct bc_det big = det(500, 400, 200, 200, 0.80f);
+	bc_tracker_update(&t2, &big, 1, 0.0, censor, dt);
+	struct bc_det tiny = det(720, 400, 40, 40, 0.80f);
+	bc_tracker_update(&t2, &tiny, 1, 66.0, censor, dt);
+	check(t2.created == 2, "a much smaller thing nearby is not the same one");
+
+	/* A track a detection already matched is not up for taking. */
+	struct bc_tracker t3;
+	bc_tracker_init(&t3, 0.35f, 0.30f, 500.0);
+	t3.revive = 1;
+	struct bc_det two[2] = { det(500, 400, 200, 200, 0.80f),
+	                         det(760, 400, 200, 200, 0.80f) };
+	bc_tracker_update(&t3, two, 2, 0.0, censor, dt);
+	bc_tracker_update(&t3, two, 2, 66.0, censor, dt);
+	check(live_tracks(&t3) == 2 && t3.revived == 0, "neighbours that match stay two tracks");
+
+	/* And it can be switched off. */
+	struct bc_tracker t4;
+	bc_tracker_init(&t4, 0.35f, 0.30f, 500.0);
+	t4.revive = 0;
+	bc_tracker_update(&t4, &a, 1, 0.0, censor, dt);
+	bc_tracker_update(&t4, &b, 1, 66.0, censor, dt);
+	check(t4.created == 2 && t4.revived == 0, "off, it opens a second track as before");
+}
+
 int main(void)
 {
 	int censor[BC_MAX_CLASSES];
@@ -356,6 +418,8 @@ int main(void)
 	test_per_class_scores(censor);
 	printf("Policy:\n");
 	test_respects_the_class_policy();
+	printf("Revival:\n");
+	test_revival(censor);
 
 	printf(failures ? "\n%d check(s) FAILED\n" : "\nAll checks passed.\n",
 	       failures);

@@ -135,6 +135,7 @@ struct bc_config {
 	float confidence;                 /* detection floor */
 	float dilate;                     /* % box growth, §2 */
 	float sticky_ms;                  /* box lifetime past last detection */
+	float delay_ms;                   /* show the screen this far behind; 0 = live */
 	int   join;                       /* merge overlapping covers into one */
 	/*
 	 * Detection grid. 1x1 is the whole screen in one inference, which is
@@ -152,6 +153,14 @@ struct bc_config {
 	 * would only duplicate the one tile there already is.
 	 */
 	int   section_full_frame;
+	/*
+	 * Derive the tiles from the screen's shape instead of from cols/rows: as
+	 * few full-height square tiles as cover the width (two on 16:9), sized so
+	 * the network input is square and nothing is letterboxed away. This is
+	 * what Hotscreen's "double detection" is. section_cols/rows/overlap are
+	 * ignored while it is on.
+	 */
+	int   section_split;
 	float join_waste;                 /* max fraction of new area a join adds */
 	float smoothing;                  /* inward edge ease, 0..1; lower = steadier */
 
@@ -319,9 +328,11 @@ struct bc_config {
 	int   saw_text_color;
 	int   saw_sections;
 	int   saw_full_frame;
+	int   saw_split;                 /* section_split */
 	int   saw_strengths;
 	int   saw_shape;
 	int   saw_grow;                  /* outline / shadow / censor colour */
+	int   saw_delay;                 /* delay_ms */
 	/*
 	 * A class line is in the wrong section: one of this model's own filed
 	 * under [classes.inactive], or another model's loose in [classes]. The

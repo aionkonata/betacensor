@@ -39,6 +39,7 @@
 #include "preprocess.h"
 #include "join.h"
 #include "offline.h"
+#include "stream.h"
 #include "util.h"
 
 #include <errno.h>
@@ -127,6 +128,7 @@ static int probe(const char *path, struct vinfo *v)
 	}
 	return 0;
 }
+
 
 static void usage(void)
 {
@@ -247,12 +249,6 @@ int main(int argc, char **argv)
 	}
 	float *tensor = malloc(bc_preproc_total_floats(pp) * sizeof *tensor);
 
-	struct bc_tracker tr;
-	bc_tracker_init(&tr, cfg.confidence, 0.30f, cfg.sticky_ms);
-	tr.same_class = bc_off_classes_similar;
-	tr.low_score  = cfg.confidence * 0.5f;
-
-	const int effect = bc_off_effect(cfg.effect);
 
 	/* ---- pipes ---- */
 	char qin[4200], qout[4200], cmd[10240];
@@ -310,9 +306,21 @@ int main(int argc, char **argv)
 		sscanf(getenv("BC_VIDEO_TEST_BOX"), "%d,%d,%d,%d",
 		       &test_box[0], &test_box[1], &test_box[2], &test_box[3]);
 
+	/*
+	 * Everything a frame goes through, with its memory between frames: the
+	 * tracker, and each eye bar's history. The same code censors the frames
+	 * of an animated GIF in bc-image.
+	 */
+	struct bc_stream st = {
+		.cfg = &cfg, .cover = cfg.censor, .det = det, .g = &g, .pp = pp,
+		.tensor = tensor, .bdg = badge ? &bdg : NULL, .harden = harden,
+		.harden_seed = harden_seed,
+		.test_box = { test_box[0], test_box[1], test_box[2], test_box[3] },
+	};
+	bc_stream_init(&st);
+
 	int    write_failed = 0, detector_hung = 0;
-	long   frame = 0, censored_frames = 0, blanked_frames = 0;
-	double covered_px = 0.0;
+	long   frame = 0;
 	double t0 = bc_off_now_ms();
 
 	while (fread(rgb, 1, fsz, dec) == fsz) {
@@ -324,122 +332,20 @@ int main(int argc, char **argv)
 		 */
 		const double t_ms = (frame * 1000.0) / vi.fps;
 
-		bc_off_upload(&g, rgb);
-
-		struct bc_det dets[BC_MAX_DET];
-		int hung = 0;
-		struct bc_det_result res =
-		    bc_off_detect(&g, pp, det, tensor, dets, BC_MAX_DET, &hung);
+		/* Detect, track, cover, bar, draw, harden, badge: stream.c. */
+		const int sr = bc_stream_frame(&st, rgb, t_ms, back, NULL, NULL);
 		/*
 		 * No outcome at all: the detector is hung. Carrying on would hand
 		 * its eventual late result to the next frame, so stop here, with
 		 * everything written so far still censored.
 		 */
-		if (hung) {
+		if (sr == BC_STREAM_HUNG) {
 			ERR("detector gave no answer for frame %ld in 10 s "
 			    "-- stopping", frame);
 			detector_hung = 1;
 			goto done;
 		}
-		const int n_det = res.status == BC_DET_OK ? res.n : 0;
 
-		/*
-		 * §6, offline. No result for this frame -- preprocess failed,
-		 * the detector refused it, or the run errored -- means nobody
-		 * looked at it, and zero detections would write it out
-		 * uncensored while the run still reported SUCCESS. Write it
-		 * black instead, and say so at the end.
-		 */
-		if (res.status != BC_DET_OK) {
-			memset(back, 0, fsz);
-			blanked_frames++;
-			censored_frames++;
-			covered_px += (double)vi.w * vi.h;
-			goto write_frame;
-		}
-
-		/* Network coordinates to frame pixels, with §2's dilation. */
-		struct bc_det sd[BC_MAX_DET];
-		int ns = 0;
-		for (int i = 0; i < n_det && ns < BC_MAX_DET; i++) {
-			if (dets[i].cls < 0 || dets[i].cls >= BC_MAX_CLASSES ||
-			    !cfg.censor[dets[i].cls])
-				continue;
-			float x0, y0, x1, y1;
-			bc_preproc_to_screen(pp, dets[i].x, dets[i].y, &x0, &y0);
-			bc_preproc_to_screen(pp, dets[i].x + dets[i].w,
-			                     dets[i].y + dets[i].h, &x1, &y1);
-			float w = x1 - x0, h = y1 - y0;
-			float dx = w * cfg.dilate / 200.0f;
-			float dy = h * cfg.dilate / 200.0f;
-			sd[ns] = dets[i];
-			sd[ns].x = x0 - dx;
-			sd[ns].y = y0 - dy;
-			sd[ns].w = w + 2 * dx;
-			sd[ns].h = h + 2 * dy;
-			ns++;
-		}
-
-		bc_tracker_update(&tr, sd, ns, t_ms, cfg.censor, NULL);
-
-		struct bc_box boxes[MAX_BOX];
-		int nb = 0;
-		for (int k = 0; k < BC_TRK_MAX && nb < MAX_BOX; k++) {
-			float x, y, w, h;
-			if (!bc_trk_box(&tr.t[k], &x, &y, &w, &h))
-				continue;
-			if (tr.t[k].cls >= 0 && tr.t[k].cls < BC_MAX_CLASSES &&
-			    !cfg.censor[tr.t[k].cls])
-				continue;
-			/* Clamp to the frame; a scissor outside it draws nothing. */
-			float x0 = x < 0.0f ? 0.0f : x;
-			float y0 = y < 0.0f ? 0.0f : y;
-			float x1 = x + w > vi.w ? (float)vi.w : x + w;
-			float y1 = y + h > vi.h ? (float)vi.h : y + h;
-			if (x1 - x0 < 1.0f || y1 - y0 < 1.0f)
-				continue;
-			/* Styled by the class that opened the track. */
-			boxes[nb] = bc_off_box(&cfg, tr.t[k].cls,
-			                       (int)x0, (int)y0,
-			                       (int)(x1 - x0), (int)(y1 - y0));
-			covered_px += (double)boxes[nb].w * boxes[nb].h;
-			nb++;
-		}
-		/*
-		 * BC_VIDEO_TEST_BOX="x,y,w,h" pins a box regardless of what was
-		 * detected, so the render path can be exercised on content that
-		 * has nothing to find in it.
-		 */
-		if (test_box[2] > 0 && nb < MAX_BOX) {
-			boxes[nb] = (struct bc_box){
-				.x = test_box[0], .y = test_box[1],
-				.w = test_box[2], .h = test_box[3],
-				.effect = effect, .strength = cfg.strength,
-				.text_mode = cfg.text_mode,
-				.text_rgb = { cfg.text_rgb[0], cfg.text_rgb[1],
-				              cfg.text_rgb[2] }
-			};
-			snprintf(boxes[nb].text, sizeof boxes[nb].text, "%s",
-			         cfg.caption[0] ? cfg.caption : "CENSORED");
-			covered_px += (double)boxes[nb].w * boxes[nb].h;
-			nb++;
-		}
-		/* Same joining as the live pass, from the same config key, so
-		 * a setting eyeballed on screen is what lands in the file. */
-		if (cfg.join && nb > 1)
-			nb = bc_join_boxes(boxes, nb, 6, cfg.join_waste);
-
-		if (nb)
-			censored_frames++;
-
-		bc_off_draw(&g, boxes, nb, t_ms / 1000.0);
-		if (harden)
-			bc_off_harden(&g, boxes, nb, harden_seed);
-		bc_off_read(&g, back);
-		if (badge)
-			bc_off_badge_apply(&bdg, back);
-
-write_frame:
 		if (fwrite(back, 1, fsz, enc) != fsz) {
 			ERR("encoder stopped accepting frames at %ld "
 			    "(%s) -- the output is truncated",
@@ -463,10 +369,20 @@ done: ;
 
 	LOG("wrote %s", out_path);
 	LOG("  frames                  : %ld", frame);
+	const long censored_frames = st.censored_frames;
+	const long blanked_frames  = st.blanked_frames;
 	LOG("  frames with a censor box: %ld (%.1f%%)", censored_frames,
 	    frame ? 100.0 * censored_frames / frame : 0.0);
 	LOG("  mean covered area       : %.2f%% of frame",
-	    frame ? 100.0 * covered_px / ((double)frame * vi.w * vi.h) : 0.0);
+	    frame ? 100.0 * st.covered_px / ((double)frame * vi.w * vi.h) : 0.0);
+	if (cfg.eye_bar && (st.eb.bars || st.eb.bands))
+		LOG("  eye bars                : %lu face-frames from landmarks, %lu "
+		    "as the band (%lu weak, %lu implausible), %lu EYE boxes left "
+		    "to them", st.eb.bars, st.eb.bands, st.eb.weak, st.eb.rejected,
+		    st.eb.eyes_dropped);
+	if (st.reused)
+		LOG("  repeated frames         : %lu reused their predecessor's "
+		    "detections", st.reused);
 	LOG("  detector errors         : %lu", bc_detect_errors(det));
 	LOG("  frames blanked (no result): %ld", blanked_frames);
 	LOG("  elapsed                 : %.1fs (%.1f fps, %.2fx realtime)",
@@ -474,6 +390,7 @@ done: ;
 	    secs > 0 ? (frame / secs) / vi.fps : 0.0);
 
 	free(rgb);
+	bc_stream_free(&st);
 	bc_off_badge_free(&bdg);
 	free(back);
 	free(tensor);
